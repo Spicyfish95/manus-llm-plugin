@@ -1,0 +1,13 @@
+- insert:
+    - id: manus-llm
+      name: '@local/manus-llm'
+      config:
+        apiKeyEnv: MANUS_API_KEY
+        defaultProfile: standard
+        pollIntervalMs: 2000
+        pollMaxSeconds: 1200
+        contextWindow: 1000000
+        maxTokens: 32000
+        requestTimeoutMs: 60000
+        showProgress: false
+        verboseEvents: false

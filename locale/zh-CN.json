@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Manus（模型提供方）",
+    "description": "将 Manus（api.manus.ai v2）注册为 DSH 可选的模型提供方。Manus 在云端代理上执行任务，结果以文本形式流回。"
+  }
+}

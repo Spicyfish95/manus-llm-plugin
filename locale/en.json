@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Manus (Model Provider)",
+    "description": "Adds Manus (api.manus.ai v2) as a selectable model provider in DSH. Manus runs tasks on its cloud agent; results stream back as text."
+  }
+}
