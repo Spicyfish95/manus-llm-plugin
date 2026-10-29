@@ -125,9 +125,9 @@ const config = {
 	pollIntervalMs: 10,
 	pollMaxSeconds: 10,
 	requestTimeoutMs: 5000,
-	contextWindow: 1000000,
 	maxTokens: 32000,
 	trackCredits: true,
+	creditPosition: "composer",
 	showProgress: false,
 	verboseEvents: false,
 	models: [
@@ -135,6 +135,8 @@ const config = {
 		{ id: "lite", name: "Manus Lite", description: "fast" },
 		{ id: "max", name: "Manus Max", description: "deep" }
 	],
+	contextWindows: { standard: 200000, lite: 500000, max: 1000000 },
+	contextWindowOf: (model) => ({ standard: 200000, lite: 500000, max: 1000000 })[model] ?? 1000000,
 	reasoningEfforts: REASONING_EFFORTS,
 	tierOf: (model, effort) => {
 		if (model === "max" && typeof effort === "string" && EFFORT_IDS.has(effort)) return effort;

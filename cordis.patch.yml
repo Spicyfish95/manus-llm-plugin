@@ -8,8 +8,12 @@
         pollIntervalMs: 2000
         pollMaxSeconds: 1200
         requestTimeoutMs: 60000
-        contextWindow: 1000000
+        modelContexts:
+          standard: 1000000
+          lite: 1000000
+          max: 1000000
         maxTokens: 32000
         trackCredits: true
+        creditPosition: composer
         showProgress: false
         verboseEvents: false

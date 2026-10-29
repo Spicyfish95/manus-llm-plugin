@@ -128,12 +128,34 @@ function walk(node, visit) {
 
 const settingsNode = settings.component({ t: (key, params) => (params === undefined ? key : `${key}:${JSON.stringify(params)}`) });
 let count = 0;
+const labels = new Set();
+function collectText(value) {
+	if (typeof value === "string") {
+		labels.add(value);
+		return;
+	}
+	if (Array.isArray(value)) {
+		for (const item of value) collectText(item);
+		return;
+	}
+	if (value === null || typeof value !== "object") return;
+	const children = value.props?.children;
+	if (typeof children === "string") labels.add(children);
+	else collectText(children);
+	collectText(value.children);
+}
 walk(settingsNode, () => {
 	count += 1;
 });
+collectText(settingsNode);
 console.log("settings nodes:", count);
-if (count < 20) throw new Error("settings page rendered suspiciously few nodes");
-
+// The page renders its head + tab strip immediately and fills the body once
+// the config route answers, so the smoke test asserts the shell is present
+// rather than a full form (fetch never resolves inside the sandbox).
+if (count < 5) throw new Error("settings page rendered suspiciously few nodes");
+if (!labels.has("settings.tab.models") || !labels.has("settings.tab.account")) {
+	throw new Error(`settings tabs missing: ${JSON.stringify([...labels])}`);
+}
 const gateNode = credits[0].component({
 	t: (key) => key,
 	position: "composer",

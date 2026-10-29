@@ -33,8 +33,10 @@
 | `pollIntervalMs` | `2000` | 轮询间隔（毫秒） |
 | `pollMaxSeconds` | `1200` | 单回合轮询上限，超时将 `task.stop` 并以 TIMEOUT 失败 |
 | `requestTimeoutMs` | `60000` | 单次 HTTP 请求超时 |
-| `contextWindow` / `maxTokens` | `1000000` / `32000` | 上报给 Harness 的模型能力（用于压缩与预算） |
+| `modelContexts` | `{standard:1000000, lite:1000000, max:1000000}` | 每个档位单独上报给 Harness 的上下文窗口，可选 `200000` / `500000` / `1000000`（在「模型」页按模型选择） |
+| `maxTokens` | `32000` | 上报给 Harness 的模型输出上限 |
 | `trackCredits` | `true` | 是否记录每轮积分消耗（工具栏「上轮消耗」依赖它） |
+| `creditPosition` | `composer` | 积分读数位置：`composer` 对话工具栏内 / `dock` 工具栏下方 |
 | `showProgress` | `false` | 是否把 Manus 的 progress 中间消息并入输出 |
 | `verboseEvents` | `false` | 轮询事件逐条写日志（调试用） |
 
@@ -53,7 +55,12 @@
 
 `client.js` 提供两块界面：
 
-1. **对话工具栏积分读数**（`conversation.input.left` 与 `conversation.composer.dock`），仅在当前模型是 `manus/*` 时出现，显示余额与「上轮消耗」，点开看分项（赠送/周期/加购/下次刷新时间）。它只调用插件自己的只读路由 `/plugins/manus-llm/credits`（仅本机回环可访问）。
-2. **「设置 → Manus」配置页**（`settings.section`，位于「技能」之后、「市场」之前），可改 API Key、默认档位、语言、轮询/超时/上下文与积分追踪开关。页面通过插件自己的 Host 路由 `/plugins/manus-llm/config`（读/写配置）与 `/plugins/manus-llm/credential`（读/写/清除 Key）工作，因此浏览器端不声明 `remote.*` 命名空间。
+1. **对话工具栏积分读数**（`conversation.input.left` 与 `conversation.composer.dock`），仅在当前模型是 `manus/*` 时出现，显示余额与「上轮消耗」，点开看分项（赠送/周期/加购/下次刷新时间）。位置由「设置 → Manus → 账号」里的「积分显示位置」控制（工具栏内 / 工具栏下方）。未配置 API Key 时按钮显示「未配置 Key」并转为警示色，不再出现重复的「积分 积分」。它只调用插件自己的只读路由 `/plugins/manus-llm/credits`（仅本机回环可访问）。
+2. **「设置 → Manus」配置页**（`settings.section`，位于「技能」之后、「市场」之前），页内分两个 tab：
+   - **模型**：逐个列出 `Manus Standard` / `Manus Lite` / `Manus Max`，每个模型右侧用分段控件选择 `200k` / `500k` / `1M` 上下文窗口，底部「保存」一次提交全部改动。
+   - **账号**：API Key 区（状态圆点 + 「已配置（来源）」/「未配置」+ 检测按钮 + 输入框 + 保存/清除），检测按钮会实时调用 Manus 余额接口并显示「已连接 · 余额 N」或失败原因；下面是默认档位、任务语言、积分显示位置，以及紧凑的运行参数（轮询间隔、最长等待、请求超时、输出上限、积分追踪/进度合并/事件日志）。
+   页面通过插件自己的 Host 路由 `/plugins/manus-llm/config`（读/写配置）、`/plugins/manus-llm/credential`（读/写/清除 Key）与 `/plugins/manus-llm/test`（连接检测）工作，因此浏览器端不声明 `remote.*` 命名空间。
+
+Manus 模型失败时的报错为中文，按错误类型给出处置建议（未配置 Key / Key 失效 / 积分不足 / 限流 / 超时 / 服务异常 / 网络不可达 / 空回复等）。
 
 API Key 始终留在 Host 侧的凭证存储中，浏览器端只会拿到「已配置/未配置」与来源，不会拿到明文。

@@ -1,174 +1,175 @@
 /**
- * dsh-manus-llm — Host plugin entry.
+ * Manus as a DSH model provider.
  *
- * Registers the Manus adapter on ctx.llm, exposes its configuration as a
- * configurable provider so the web Models page can activate and edit it, and
- * serves one read-only credit route for the composer readout.
+ * Host half: registers a `manus` LLM adapter, a configurable provider entry
+ * (so the Models page and the settings dialog can find it), model discovery,
+ * and three loopback-only routes used by the plugin's own browser half:
  *
- * Settings integration (the dsh-connect-trae pattern for 0.1.7+):
- * - The Config schema's volatile-marked fields ARE the settings page form.
- *   The host's settings write gate rejects any edit outside a volatile node,
- *   and `SettingsForms.describe()` projects only volatile fields — a schema
- *   with no volatile field renders nothing and refuses every write.
- * - `settings.configure({ auto: true }, ctx.fiber)` registers this plugin's
- *   automatic page under the Loader entry id (`ctx.fiber.entry?.options.id`),
- *   which is also the settingsNs advertised through the configurable-provider
- *   directory — the key the Models page looks up.
- * - Volatile values arrive as live `{ get(): T }` references; every read
- *   unwraps with `value?.get?.() ?? value`.
+ *   GET  /plugins/manus-llm/credits?sessionId=…  → live balance + last-turn spend
+ *   GET  /plugins/manus-llm/config               → settings values + revision
+ *   POST /plugins/manus-llm/config               → settings.mutate (volatile-gated)
+ *   GET  /plugins/manus-llm/credential           → API-key status
+ *   POST /plugins/manus-llm/credential           → store the API key
+ *   DELETE /plugins/manus-llm/credential         → clear the API key
+ *   GET  /plugins/manus-llm/test                 → last connection probe result
+ *   POST /plugins/manus-llm/test                 → run a connection probe now
  *
- * Model tiers: three catalog entries (standard / lite / max). The `max`
- * entry carries the reasoning metadata, so the composer's model picker offers
- * the deeper Max thinking levels as reasoning efforts — Manus itself takes
- * them as `agent_profile` values, which is exactly what an effort id is here.
+ * Every settings field carries `.volatile()`: DSH's settings write gate
+ * refuses any write to a non-volatile path, and `volatileForm` hides
+ * namespaces that expose none. Writes funnel through `settings.mutate` so the
+ * volatile gate stays the single authority, and a stale revision surfaces as
+ * a conflict instead of clobbering another window.
  */
 import z from "@deepseek-ai/schemastery";
 import { ManusAdapter, MANUS_API_BASE } from "./adapter.js";
 
 export const name = "manus-llm";
-
-/** The adapter stays inert without this service; webServer is optional. */
 export const inject = ["llm"];
 
-/** The provider route key shared by the adapter, the directory, and the UI. */
 const PROVIDER = "manus";
-
-/** Plugin-owned credit route consumed by the browser half. */
 const CREDITS_PATH = "/plugins/manus-llm/credits";
-
-/** Plugin-owned settings routes consumed by the settings-dialog page. */
 const CONFIG_PATH = "/plugins/manus-llm/config";
 const CREDENTIAL_PATH = "/plugins/manus-llm/credential";
+const TEST_PATH = "/plugins/manus-llm/test";
 
-/**
- * Reasoning efforts offered under the `max` model. Every id is a valid
- * `agent_profile` value, and `max` is the plain default thinking level
- * ("max" with no thinking-level suffix) — so the default effort needs no
- * rewriting on the wire.
- */
+/** Thinking levels of the Max tier. The id IS the wire `agent_profile`. */
 const REASONING_EFFORTS = [
-	{ id: "max", name: "default", description: "Max 档的默认思考等级（对应 Manus 的 max 档默认值）。" },
-	{ id: "max-medium", name: "中", description: "Max 档，中等思考深度。" },
-	{ id: "max-high", name: "高", description: "Max 档，较高思考深度。" },
-	{ id: "max-extra", name: "增强", description: "Max 档，更强思考深度（耗时与积分更高）。" },
-	{ id: "max-ultra", name: "极致", description: "Max 档，最深推理（最慢、积分消耗最高）。" }
+	{ id: "max", name: "default", description: "Max 档的默认思考等级。" },
+	{ id: "max-medium", name: "中", description: "中等思考强度。" },
+	{ id: "max-high", name: "高", description: "较高思考强度。" },
+	{ id: "max-extra", name: "增强", description: "增强思考强度。" },
+	{ id: "max-ultra", name: "极致", description: "最高思考强度。" }
 ];
-
 const EFFORT_IDS = new Set(REASONING_EFFORTS.map((effort) => effort.id));
 
-/** Model catalog: three Manus agent tiers as selectable "models". */
+/** The three tiers exposed as models, in menu order. */
 const MODEL_CATALOG = [
-	{
-		id: "standard",
-		name: "Manus Standard",
-		description: "Manus 标准代理档位：速度与能力均衡。"
-	},
-	{
-		id: "lite",
-		name: "Manus Lite",
-		description: "轻量快速档位，积分消耗更低。"
-	},
-	{
-		id: "max",
-		name: "Manus Max",
-		description: "深度推理档位；可在模型选择器里挑选 Max 的思考等级。"
-	}
+	{ id: "standard", name: "Manus Standard", description: "Manus 标准档，日常任务与快速迭代。" },
+	{ id: "lite", name: "Manus Lite", description: "Manus 轻量档，最低消耗，适合简单问答。" },
+	{ id: "max", name: "Manus Max", description: "Manus Max 档，可再选思考等级（默认/中/高/增强/极致）。" }
 ];
-
 const TIERS = new Set(MODEL_CATALOG.map((model) => model.id));
 
-/** Unwrap one volatile live reference (or plain value) without dropping siblings. */
+/** Per-model context-window choices offered in the settings page. */
+const CONTEXT_OPTIONS = [200000, 500000, 1000000];
+const DEFAULT_CONTEXT_WINDOW = 1000000;
+
+/** Credit readout placement: inside the composer toolbar or below it. */
+const CREDIT_POSITIONS = ["composer", "dock"];
+
+/** Unwrap a live `{get(): T}` volatile ref, falling back on null/undefined. */
 function unwrap(value, fallback) {
-	const resolved = value?.get?.() ?? value;
-	return resolved === undefined || resolved === null ? fallback : resolved;
+	const plain = value?.get?.() ?? value;
+	return plain === null || plain === undefined ? fallback : plain;
 }
 
-/** Settings schema for the plugin: every volatile field is editable on the
- * web (Models page editor card + the plugin's automatic settings page). */
+function contextField() {
+	return z.union(CONTEXT_OPTIONS.map((value) => z.const(value))).default(DEFAULT_CONTEXT_WINDOW);
+}
+
 export const Config = z.object({
-	apiKeyEnv: z.string().role("credential-ref").default("MANUS_API_KEY").volatile()
-		.description("存储 Manus API Key 的凭证引用名（环境变量名）。在「设置 → 模型」页选择 Manus 并输入 Key 后自动写入。"),
-	defaultProfile: z.union([
-		z.const("standard"),
-		z.const("lite"),
-		z.const("max")
-	]).default("standard").volatile()
-		.description("未知模型 id 时回退的 Manus 档位。"),
-	locale: z.string().default("zh-CN").volatile()
-		.description("Manus 任务输出语言（BCP 47，如 zh-CN / en）。"),
-	pollIntervalMs: z.number().min(500).max(30000).default(2000).volatile()
-		.description("轮询任务消息的间隔（毫秒）。"),
-	pollMaxSeconds: z.number().min(30).max(86400).default(1200).volatile()
-		.description("单回合轮询上限（秒）；超时会停止远端任务并以 TIMEOUT 失败。"),
-	requestTimeoutMs: z.number().min(5000).max(300000).default(60000).volatile()
-		.description("单次 HTTP 请求超时（毫秒）。"),
-	contextWindow: z.number().min(1000).default(1000000).volatile()
-		.description("上报给 DSH 的上下文窗口（用于压缩与预算估算）。"),
-	maxTokens: z.number().min(100).default(32000).volatile()
-		.description("上报给 DSH 的单回合最大输出 token。"),
-	trackCredits: z.boolean().default(true).volatile()
-		.description("记录每轮对话消耗的积分（回合前后各读一次余额，用于工具栏显示「上轮消耗」）。"),
-	showProgress: z.boolean().default(false).volatile()
-		.description("是否把 Manus 的 progress 中间消息并入回复文本。"),
-	verboseEvents: z.boolean().default(false).volatile()
-		.description("在日志中记录每个轮询事件（调试用）。")
+	apiKeyEnv: z
+		.string()
+		.role("credential-ref")
+		.default("MANUS_API_KEY")
+		.volatile()
+		.description("存放 Manus API Key 的凭证名。通过「设置 → Manus」写入，无需改环境变量。"),
+	defaultProfile: z
+		.union([z.const("standard"), z.const("lite"), z.const("max")])
+		.default("max")
+		.volatile()
+		.description("默认模型档位；对话里仍可从模型菜单切换。"),
+	locale: z.string().default("zh-CN").volatile().description("传给 Manus 的界面/语言区域，例如 zh-CN 或 en-US。"),
+	pollIntervalMs: z
+		.number()
+		.min(500)
+		.max(30000)
+		.default(2000)
+		.volatile()
+		.description("轮询 Manus 任务事件的间隔（毫秒）。"),
+	pollMaxSeconds: z
+		.number()
+		.min(30)
+		.max(86400)
+		.default(1200)
+		.volatile()
+		.description("单轮任务最长等待时间（秒）；超时会尝试停止任务并报错。"),
+	requestTimeoutMs: z
+		.number()
+		.min(5000)
+		.max(300000)
+		.default(60000)
+		.volatile()
+		.description("单个 HTTP 请求超时（毫秒）。"),
+	modelContexts: z
+		.object({
+			standard: contextField(),
+			lite: contextField(),
+			max: contextField()
+		})
+		.default({ standard: DEFAULT_CONTEXT_WINDOW, lite: DEFAULT_CONTEXT_WINDOW, max: DEFAULT_CONTEXT_WINDOW })
+		.volatile()
+		.description("每个模型档位单独上报给对话的上下文窗口（20 万 / 50 万 / 100 万）。"),
+	maxTokens: z.number().min(100).default(32000).volatile().description("单轮最大输出 token 预算（上报值）。"),
+	trackCredits: z
+		.boolean()
+		.default(true)
+		.volatile()
+		.description("是否在每轮对话前后读取积分余额，并在工具栏显示本轮消耗。"),
+	creditPosition: z
+		.union([z.const("composer"), z.const("dock")])
+		.default("composer")
+		.volatile()
+		.description("积分显示位置：输入框工具栏内（composer）或输入框下方（dock）。"),
+	showProgress: z
+		.boolean()
+		.default(false)
+		.volatile()
+		.description("是否把 Manus 的中间进度消息也流式输出到对话里。"),
+	verboseEvents: z.boolean().default(false).volatile().description("调试用：把非对话事件也写入日志。")
 });
 
-/**
- * Validate one tier id from the model id slot. Unknown ids fall back to the
- * configured default rather than failing the call, because catalog ids travel
- * through durable history.
- */
 function normalizeTier(model, fallback) {
-	if (TIERS.has(model)) return model;
+	if (typeof model === "string" && TIERS.has(model)) return model;
 	return TIERS.has(fallback) ? fallback : "standard";
 }
 
-/** Write one JSON answer on a plugin route (mirrors dsh-connect-trae's helper). */
 function json(res, status, body) {
 	const payload = JSON.stringify(body);
-	res.writeHead(status, {
-		"Content-Type": "application/json",
-		"Content-Length": Buffer.byteLength(payload)
-	});
+	res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
 	res.end(payload);
 }
 
-/** Only the local GUI may call plugin routes; a foreign Origin is refused. */
 function loopbackOrigin(req) {
 	const origin = req.headers.origin;
-	if (origin === undefined) return true;
+	if (typeof origin !== "string" || origin.length === 0) return true;
 	try {
-		const { hostname } = new URL(origin);
-		return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+		const host = new URL(origin).hostname;
+		return host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
 	} catch {
 		return false;
 	}
 }
 
-/** Strip anything token-shaped out of an error before it reaches the browser. */
 function safeMessage(error) {
-	return (error instanceof Error ? error.message : String(error))
-		.replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gu, "[redacted token]")
-		.slice(0, 300);
+	const text = typeof error?.message === "string" ? error.message : String(error ?? "");
+	return text.replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[redacted token]").slice(0, 300);
 }
 
-/** Read a small JSON body from a plugin route request. */
 async function readJsonBody(req, limitBytes = 8192) {
 	const chunks = [];
-	let total = 0;
+	let size = 0;
 	for await (const chunk of req) {
-		total += chunk.length;
-		if (total > limitBytes) throw new Error("request body too large");
+		size += chunk.length;
+		if (size > limitBytes) throw new Error("request body too large");
 		chunks.push(chunk);
 	}
-	if (total === 0) return {};
-	const raw = Buffer.concat(chunks).toString("utf8");
-	const parsed = JSON.parse(raw);
-	return parsed !== null && typeof parsed === "object" ? parsed : {};
+	if (size === 0) return {};
+	const text = Buffer.concat(chunks).toString("utf8");
+	return text.length === 0 ? {} : JSON.parse(text);
 }
 
-/** The volatile field names the settings page may write. */
+/** Single-segment writable settings fields (nested modelContexts is special). */
 const WRITABLE_FIELDS = new Set([
 	"apiKeyEnv",
 	"defaultProfile",
@@ -176,9 +177,9 @@ const WRITABLE_FIELDS = new Set([
 	"pollIntervalMs",
 	"pollMaxSeconds",
 	"requestTimeoutMs",
-	"contextWindow",
 	"maxTokens",
 	"trackCredits",
+	"creditPosition",
 	"showProgress",
 	"verboseEvents"
 ]);
@@ -186,76 +187,82 @@ const WRITABLE_FIELDS = new Set([
 export function apply(ctx, config) {
 	const entryId = ctx.fiber?.entry?.options?.id ?? name;
 
-	// Register the automatic settings page under the Loader entry id — the same
-	// namespace the configurable-provider directory advertises, which is what
-	// the Models page's editor card binds to. Rejected politely when the
-	// settings service is absent (the adapter keeps working off loader config).
+	// Register the settings page policy. `auto: true` lets the settings
+	// dialog render this entry's volatile fields without a bespoke client
+	// page; the plugin's own page is an extra surface, not a replacement.
 	ctx.inject(["settings"], (settingsCtx) => {
 		settingsCtx.effect(() => settingsCtx.settings.configure({ auto: true }, ctx.fiber));
 	});
 
-	/** Resolve the live connection snapshot each dispatch reads. Volatile
-	 * fields arrive as live references and unwrap per read, so a settings
-	 * write reaches the next dispatch without a plugin restart. */
+	const contextWindows = () => {
+		const raw = unwrap(config.modelContexts, {});
+		const source = typeof raw === "object" && raw !== null ? raw : {};
+		const windows = {};
+		for (const tier of TIERS) {
+			const value = source[tier];
+			windows[tier] = CONTEXT_OPTIONS.includes(value) ? value : DEFAULT_CONTEXT_WINDOW;
+		}
+		return windows;
+	};
+
 	const resolveConfig = () => {
-		const apiKeyEnv = unwrap(config.apiKeyEnv, "MANUS_API_KEY");
-		const fallbackTier = unwrap(config.defaultProfile, "standard");
+		const fallbackTier = unwrap(config.defaultProfile, "max");
+		const windows = contextWindows();
 		return {
-			apiKeyEnv,
-			locale: (unwrap(config.locale, "zh-CN") || "").trim() || undefined,
+			apiKeyEnv: unwrap(config.apiKeyEnv, "MANUS_API_KEY"),
+			locale: unwrap(config.locale, "zh-CN"),
 			pollIntervalMs: unwrap(config.pollIntervalMs, 2000),
 			pollMaxSeconds: unwrap(config.pollMaxSeconds, 1200),
 			requestTimeoutMs: unwrap(config.requestTimeoutMs, 60000),
-			contextWindow: unwrap(config.contextWindow, 1000000),
 			maxTokens: unwrap(config.maxTokens, 32000),
 			trackCredits: unwrap(config.trackCredits, true) === true,
+			creditPosition: CREDIT_POSITIONS.includes(unwrap(config.creditPosition, "composer"))
+				? unwrap(config.creditPosition, "composer")
+				: "composer",
 			showProgress: unwrap(config.showProgress, false) === true,
 			verboseEvents: unwrap(config.verboseEvents, false) === true,
 			models: MODEL_CATALOG,
 			reasoningEfforts: REASONING_EFFORTS,
+			contextWindows: windows,
+			contextWindowOf: (model) => windows[normalizeTier(model, fallbackTier)] ?? DEFAULT_CONTEXT_WINDOW,
 			tierOf: (model, effort) => {
-				// `max` plus a deeper effort is exactly that agent_profile; every
-				// other route keeps its own tier.
 				if (model === "max" && typeof effort === "string" && EFFORT_IDS.has(effort)) return effort;
 				return normalizeTier(model, fallbackTier);
 			}
 		};
 	};
 
-	/** Resolve the API key per dispatch: the credentials seam first (the
-	 * managed store the web Models page writes, then ambient env / .env
-	 * fallbacks), then the plain process environment. */
 	const resolveApiKey = async (ref) => {
 		const credentials = ctx.get("credentials");
 		if (credentials !== undefined) {
 			const hit = await credentials.resolve(ref);
-			if (hit !== undefined && typeof hit.value === "string" && hit.value.trim().length > 0) {
-				return hit.value.trim();
-			}
+			if (hit !== undefined && typeof hit.value === "string" && hit.value.trim().length > 0) return hit.value.trim();
 		}
 		const ambient = process.env[ref];
-		if (typeof ambient === "string" && ambient.trim().length > 0) return ambient.trim();
-		return undefined;
+		return typeof ambient === "string" && ambient.trim().length > 0 ? ambient.trim() : undefined;
 	};
 
 	const log = (message) => {
 		ctx.logger?.info?.(message);
 	};
 
-	/**
-	 * Per-session record of the last finished turn's credit delta, written by
-	 * the adapter and read by the composer route. In-memory on purpose: it
-	 * describes "the round that just ran", not durable history.
-	 */
+	// Per-session last-turn spend, bounded so a long-lived process cannot
+	// grow it without limit. In-memory only: it is a readout, not state.
 	const creditTurns = new Map();
 	const credits = {
 		record(sessionId, spent) {
-			if (typeof spent !== "number" || !Number.isFinite(spent)) return;
+			if (!Number.isFinite(spent)) return;
 			creditTurns.set(sessionId ?? "", { spent, at: Date.now() });
-			// Bounded: one entry per live session, oldest evicted past 64.
 			if (creditTurns.size > 64) {
-				const oldest = [...creditTurns.entries()].sort((a, b) => a[1].at - b[1].at)[0];
-				if (oldest !== undefined) creditTurns.delete(oldest[0]);
+				let oldestKey;
+				let oldestAt = Infinity;
+				for (const [key, value] of creditTurns) {
+					if (value.at < oldestAt) {
+						oldestAt = value.at;
+						oldestKey = key;
+					}
+				}
+				if (oldestKey !== undefined) creditTurns.delete(oldestKey);
 			}
 		},
 		lastTurn(sessionId) {
@@ -266,205 +273,312 @@ export function apply(ctx, config) {
 	const adapter = new ManusAdapter(resolveConfig, resolveApiKey, log, credits);
 	ctx.llm.registerAdapter([PROVIDER], adapter);
 
-	// Configurable-provider directory: the web Models page reads this to offer
-	// activation, a settings namespace, and model discovery for the route.
-	ctx.llm.registerConfigurableProviders([{
-		provider: PROVIDER,
-		displayName: "Manus",
-		settingsNs: entryId,
-		settingsPath: [],
-		defaultBaseURL: MANUS_API_BASE,
-		nativeAuth: { env: ["MANUS_API_KEY"] }
-	}]);
+	ctx.llm.registerConfigurableProviders([
+		{
+			provider: PROVIDER,
+			displayName: "Manus",
+			settingsNs: entryId,
+			settingsPath: [],
+			defaultBaseURL: MANUS_API_BASE,
+			nativeAuth: { env: ["MANUS_API_KEY"] }
+		}
+	]);
 
-	// Model discovery for the Models page's "discover" action.
 	ctx.llm.registerModelDiscovery(entryId, async (request, signal) => {
 		signal?.throwIfAborted?.();
-		// Manus has no /models endpoint; the tier list is static.
+		const conf = resolveConfig();
 		return MODEL_CATALOG.map((model) => ({
 			id: model.id,
 			name: model.name,
-			contextWindow: unwrap(config.contextWindow, 1000000),
-			maxTokens: unwrap(config.maxTokens, 32000)
+			description: model.description,
+			contextWindow: conf.contextWindowOf(model.id),
+			maxTokens: conf.maxTokens
 		}));
 	});
 
-	/**
-	 * Credit route for the composer readout: the authoritative balance plus the
-	 * last finished turn's spend for the asking session. Read-only, loopback
-	 * only, and the key never leaves the Host.
-	 */
+	/** Last connection probe, kept in memory so the page can show it. */
+	let lastProbe;
+
 	ctx.inject(["webServer"], (webCtx) => {
-		webCtx.effect(() => webCtx.webServer.register({
-			kind: "exact",
-			path: CREDITS_PATH,
-			handler: async (req, res) => {
-				if (req.method !== "GET") return json(res, 405, { error: "method not allowed" });
-				if (!loopbackOrigin(req)) return json(res, 403, { error: "origin-not-trusted" });
-				const sessionId = new URL(req.url ?? "/", "http://localhost").searchParams.get("sessionId") ?? "";
-				try {
-					const apiKey = await resolveApiKey(unwrap(config.apiKeyEnv, "MANUS_API_KEY"));
-					if (apiKey === undefined) return json(res, 200, { ok: false, error: { code: "missing-credential", message: "未配置 Manus API Key" } });
-					const balance = await adapter.fetchCredits(apiKey);
-					const lastTurn = credits.lastTurn(sessionId);
-					json(res, 200, {
-						ok: true,
-						...(balance === undefined ? {} : { credits: balance }),
-						...(lastTurn === undefined ? {} : { lastTurn })
-					});
-				} catch (error) {
-					json(res, 500, { ok: false, error: { code: "credits-unavailable", message: safeMessage(error) } });
-				}
-			}
-		}), "manus-llm: credits route");
-	});
-
-	/**
-	 * Settings-dialog routes. The plugin's own settings page reads and writes
-	 * through these instead of the Remote settings/credentials namespaces, so
-	 * the browser bundle needs no `remote.*` declaration (the pattern
-	 * dsh-skills-manager and dsh-connect-trae already ship).
-	 *
-	 * Writes go through `settings.mutate` — the same volatile-gated path the
-	 * Models page uses — so the schema's volatility rules stay the single
-	 * authority and a stale revision reports a conflict instead of clobbering.
-	 */
-	ctx.inject(["webServer"], (webCtx) => {
-		webCtx.effect(() => webCtx.webServer.register({
-			kind: "exact",
-			path: CONFIG_PATH,
-			handler: async (req, res) => {
-				if (!loopbackOrigin(req)) return json(res, 403, { ok: false, error: { code: "origin-not-trusted" } });
-				const settings = ctx.get("settings");
-				const credentials = ctx.get("credentials");
-				const apiKeyEnv = unwrap(config.apiKeyEnv, "MANUS_API_KEY");
-
-				if (req.method === "GET") {
-					let revision;
-					try {
-						revision = settings?.describe?.()?.find?.((row) => row.ns === entryId)?.revision;
-					} catch {
-						revision = undefined;
-					}
-					let credential;
-					try {
-						credential = await credentials?.describe?.(apiKeyEnv);
-					} catch {
-						credential = undefined;
-					}
-					return json(res, 200, {
-						ok: true,
-						entryId,
-						revision,
-						credential: credential ?? { configured: false, writable: true },
-						values: {
-							apiKeyEnv,
-							defaultProfile: unwrap(config.defaultProfile, "standard"),
-							locale: unwrap(config.locale, "zh-CN"),
-							pollIntervalMs: unwrap(config.pollIntervalMs, 2000),
-							pollMaxSeconds: unwrap(config.pollMaxSeconds, 1200),
-							requestTimeoutMs: unwrap(config.requestTimeoutMs, 60000),
-							contextWindow: unwrap(config.contextWindow, 1000000),
-							maxTokens: unwrap(config.maxTokens, 32000),
-							trackCredits: unwrap(config.trackCredits, true) === true,
-							showProgress: unwrap(config.showProgress, false) === true,
-							verboseEvents: unwrap(config.verboseEvents, false) === true
-						},
-						models: MODEL_CATALOG,
-						tiers: [...TIERS],
-						reasoningEfforts: REASONING_EFFORTS
-					});
-				}
-
-				if (req.method !== "POST") return json(res, 405, { ok: false, error: { code: "method-not-allowed" } });
-				if (settings === undefined) return json(res, 503, { ok: false, error: { code: "settings-unavailable", message: "设置服务不可用" } });
-
-				let body;
-				try {
-					body = await readJsonBody(req);
-				} catch (error) {
-					return json(res, 400, { ok: false, error: { code: "invalid-body", message: safeMessage(error) } });
-				}
-
-				const ops = Array.isArray(body.ops) ? body.ops : [];
-				if (ops.length === 0) return json(res, 400, { ok: false, error: { code: "empty-ops", message: "没有需要写入的字段" } });
-				const cleaned = [];
-				for (const op of ops) {
-					const path = Array.isArray(op?.path) ? op.path : [];
-					if (path.length !== 1 || typeof path[0] !== "string" || !WRITABLE_FIELDS.has(path[0])) {
-						return json(res, 400, { ok: false, error: { code: "not-writable", message: `字段不可写：${path.join(".") || "(空)"}` } });
-					}
-					cleaned.push(op.op === "unset" ? { op: "unset", path: [path[0]] } : { op: "set", path: [path[0]], value: op.value });
-				}
-
-				try {
-					const revision = typeof body.revision === "number" ? body.revision : undefined;
-					await settings.mutate(entryId, cleaned, revision);
-					const next = settings.describe().find((row) => row.ns === entryId);
-					return json(res, 200, { ok: true, revision: next?.revision });
-				} catch (error) {
-					const conflict = error?.name === "SettingsConflictError" || /revision/i.test(String(error?.message ?? ""));
-					return json(res, conflict ? 409 : 400, {
-						ok: false,
-						error: {
-							code: conflict ? "settings-conflict" : "write-failed",
-							message: safeMessage(error)
+		webCtx.effect(
+			() =>
+				webCtx.webServer.register({
+					kind: "exact",
+					path: CREDITS_PATH,
+					handler: async (req, res) => {
+						if (req.method !== "GET") {
+							json(res, 405, { ok: false, error: { code: "method-not-allowed", message: "仅支持 GET" } });
+							return;
 						}
-					});
-				}
-			}
-		}), "manus-llm: config route");
-
-		webCtx.effect(() => webCtx.webServer.register({
-			kind: "exact",
-			path: CREDENTIAL_PATH,
-			handler: async (req, res) => {
-				if (!loopbackOrigin(req)) return json(res, 403, { ok: false, error: { code: "origin-not-trusted" } });
-				const credentials = ctx.get("credentials");
-				if (credentials === undefined) return json(res, 503, { ok: false, error: { code: "credentials-unavailable", message: "凭证服务不可用" } });
-				const apiKeyEnv = unwrap(config.apiKeyEnv, "MANUS_API_KEY");
-
-				if (req.method === "GET") {
-					const described = await credentials.describe(apiKeyEnv);
-					return json(res, 200, { ok: true, apiKeyEnv, credential: described });
-				}
-
-				if (req.method === "DELETE" || (req.method === "POST" && new URL(req.url ?? "/", "http://localhost").searchParams.get("action") === "clear")) {
-					try {
-						await credentials.unset(apiKeyEnv);
-						return json(res, 200, { ok: true, apiKeyEnv, credential: await credentials.describe(apiKeyEnv) });
-					} catch (error) {
-						return json(res, 500, { ok: false, error: { code: "credential-unset-failed", message: safeMessage(error) } });
+						if (!loopbackOrigin(req)) {
+							json(res, 403, { ok: false, error: { code: "origin-not-trusted", message: "仅允许本机访问" } });
+							return;
+						}
+						try {
+							const sessionId = new URL(req.url ?? "/", "http://localhost").searchParams.get("sessionId") ?? "";
+							const apiKey = await resolveApiKey(unwrap(config.apiKeyEnv, "MANUS_API_KEY"));
+							if (apiKey === undefined) {
+								json(res, 200, {
+									ok: false,
+									error: { code: "missing-credential", message: "未配置 Manus API Key" }
+								});
+								return;
+							}
+							const balance = await adapter.fetchCredits(apiKey);
+							const lastTurn = credits.lastTurn(sessionId);
+							json(res, 200, {
+								ok: true,
+								...(balance === undefined ? {} : { credits: balance }),
+								...(lastTurn === undefined ? {} : { lastTurn })
+							});
+						} catch (error) {
+							json(res, 500, { ok: false, error: { code: "credits-unavailable", message: safeMessage(error) } });
+						}
 					}
-				}
+				}),
+			"manus-llm: credits route"
+		);
 
-				if (req.method !== "POST") return json(res, 405, { ok: false, error: { code: "method-not-allowed" } });
-				let body;
-				try {
-					body = await readJsonBody(req);
-				} catch (error) {
-					return json(res, 400, { ok: false, error: { code: "invalid-body", message: safeMessage(error) } });
-				}
-				const value = typeof body.value === "string" ? body.value.trim() : "";
-				if (value.length === 0) return json(res, 400, { ok: false, error: { code: "empty-credential", message: "API Key 不能为空" } });
-				try {
-					await credentials.set(apiKeyEnv, value);
-					return json(res, 200, { ok: true, apiKeyEnv, credential: await credentials.describe(apiKeyEnv) });
-				} catch (error) {
-					return json(res, 500, { ok: false, error: { code: "credential-write-failed", message: safeMessage(error) } });
-				}
-			}
-		}), "manus-llm: credential route");
+		// Connection probe: one Manus call, no state change. GET reports the
+		// last result so a freshly opened page can show it without hitting
+		// the API; POST runs a fresh check (the 「测试」button).
+		webCtx.effect(
+			() =>
+				webCtx.webServer.register({
+					kind: "exact",
+					path: TEST_PATH,
+					handler: async (req, res) => {
+						if (req.method !== "GET" && req.method !== "POST") {
+							json(res, 405, { ok: false, error: { code: "method-not-allowed", message: "仅支持 GET/POST" } });
+							return;
+						}
+						if (!loopbackOrigin(req)) {
+							json(res, 403, { ok: false, error: { code: "origin-not-trusted", message: "仅允许本机访问" } });
+							return;
+						}
+						try {
+							const apiKeyEnv = unwrap(config.apiKeyEnv, "MANUS_API_KEY");
+							const apiKey = await resolveApiKey(apiKeyEnv);
+							if (apiKey === undefined) {
+								lastProbe = undefined;
+								json(res, 200, {
+									ok: true,
+									configured: false,
+									connected: false,
+									error: { code: "missing-credential", message: "未配置 API Key" }
+								});
+								return;
+							}
+							if (req.method === "GET") {
+								json(res, 200, { ok: true, configured: true, ...(lastProbe === undefined ? {} : { probe: lastProbe }) });
+								return;
+							}
+							const probe = await adapter.probe(apiKey);
+							lastProbe = probe;
+							json(res, 200, {
+								ok: true,
+								configured: true,
+								connected: probe.ok === true,
+								probe
+							});
+						} catch (error) {
+							json(res, 500, { ok: false, error: { code: "probe-failed", message: safeMessage(error) } });
+						}
+					}
+				}),
+			"manus-llm: test route"
+		);
+
+		webCtx.effect(
+			() =>
+				webCtx.webServer.register({
+					kind: "exact",
+					path: CONFIG_PATH,
+					handler: async (req, res) => {
+						if (req.method !== "GET" && req.method !== "POST") {
+							json(res, 405, { ok: false, error: { code: "method-not-allowed", message: "仅支持 GET/POST" } });
+							return;
+						}
+						if (!loopbackOrigin(req)) {
+							json(res, 403, { ok: false, error: { code: "origin-not-trusted", message: "仅允许本机访问" } });
+							return;
+						}
+						const settings = ctx.get("settings");
+						const credentials = ctx.get("credentials");
+						const apiKeyEnv = unwrap(config.apiKeyEnv, "MANUS_API_KEY");
+
+						if (req.method === "GET") {
+							let revision;
+							try {
+								revision = settings?.describe?.()?.find?.((row) => row.ns === entryId)?.revision;
+							} catch {
+								revision = undefined;
+							}
+							let credential;
+							try {
+								credential = await credentials?.describe?.(apiKeyEnv);
+							} catch {
+								credential = undefined;
+							}
+							const conf = resolveConfig();
+							json(res, 200, {
+								ok: true,
+								entryId,
+								revision,
+								credential: credential ?? { configured: false, writable: true },
+								values: {
+									apiKeyEnv: conf.apiKeyEnv,
+									defaultProfile: unwrap(config.defaultProfile, "max"),
+									locale: conf.locale,
+									pollIntervalMs: conf.pollIntervalMs,
+									pollMaxSeconds: conf.pollMaxSeconds,
+									requestTimeoutMs: conf.requestTimeoutMs,
+									modelContexts: conf.contextWindows,
+									maxTokens: conf.maxTokens,
+									trackCredits: conf.trackCredits,
+									creditPosition: conf.creditPosition,
+									showProgress: conf.showProgress,
+									verboseEvents: conf.verboseEvents
+								},
+								contextOptions: CONTEXT_OPTIONS,
+								models: MODEL_CATALOG,
+								tiers: [...TIERS],
+								creditPositions: CREDIT_POSITIONS,
+								reasoningEfforts: REASONING_EFFORTS,
+								...(lastProbe === undefined ? {} : { probe: lastProbe })
+							});
+							return;
+						}
+
+						if (settings === undefined) {
+							json(res, 503, { ok: false, error: { code: "settings-unavailable", message: "设置服务不可用" } });
+							return;
+						}
+						let body;
+						try {
+							body = await readJsonBody(req);
+						} catch (error) {
+							json(res, 400, { ok: false, error: { code: "invalid-body", message: safeMessage(error) } });
+							return;
+						}
+						const ops = Array.isArray(body.ops) ? body.ops : [];
+						if (ops.length === 0) {
+							json(res, 400, { ok: false, error: { code: "empty-ops", message: "没有需要写入的字段" } });
+							return;
+						}
+						const cleaned = [];
+						for (const op of ops) {
+							const path = Array.isArray(op?.path) ? op.path : [];
+							const single = path.length === 1 && typeof path[0] === "string" && WRITABLE_FIELDS.has(path[0]);
+							const nested =
+								path.length === 2 &&
+								path[0] === "modelContexts" &&
+								typeof path[1] === "string" &&
+								TIERS.has(path[1]) &&
+								CONTEXT_OPTIONS.includes(op?.value);
+							if (!single && !nested) {
+								json(res, 400, {
+									ok: false,
+									error: { code: "not-writable", message: `字段不可写：${path.join(".") || "(空)"}` }
+								});
+								return;
+							}
+							cleaned.push(
+								op.op === "unset" ? { op: "unset", path } : { op: "set", path, value: op.value }
+							);
+						}
+						const revision = typeof body.revision === "number" ? body.revision : undefined;
+						try {
+							await settings.mutate(entryId, cleaned, revision);
+							json(res, 200, {
+								ok: true,
+								revision: settings.describe().find((row) => row.ns === entryId)?.revision
+							});
+						} catch (error) {
+							const conflict = error?.name === "SettingsConflictError" || /revision/i.test(String(error?.message ?? ""));
+							json(res, conflict ? 409 : 400, {
+								ok: false,
+								error: {
+									code: conflict ? "settings-conflict" : "write-failed",
+									message: safeMessage(error)
+								}
+							});
+						}
+					}
+				}),
+			"manus-llm: config route"
+		);
+
+		webCtx.effect(
+			() =>
+				webCtx.webServer.register({
+					kind: "exact",
+					path: CREDENTIAL_PATH,
+					handler: async (req, res) => {
+						if (!loopbackOrigin(req)) {
+							json(res, 403, { ok: false, error: { code: "origin-not-trusted", message: "仅允许本机访问" } });
+							return;
+						}
+						const credentials = ctx.get("credentials");
+						if (credentials === undefined) {
+							json(res, 503, { ok: false, error: { code: "credentials-unavailable", message: "凭证服务不可用" } });
+							return;
+						}
+						const apiKeyEnv = unwrap(config.apiKeyEnv, "MANUS_API_KEY");
+
+						if (req.method === "GET") {
+							const credential = await credentials.describe(apiKeyEnv).catch(() => undefined);
+							json(res, 200, { ok: true, apiKeyEnv, credential: credential ?? { configured: false, writable: true } });
+							return;
+						}
+
+						const url = new URL(req.url ?? "/", "http://localhost");
+						const clear = req.method === "DELETE" || (req.method === "POST" && url.searchParams.get("action") === "clear");
+						if (clear) {
+							try {
+								await credentials.unset(apiKeyEnv);
+								lastProbe = undefined;
+								const credential = await credentials.describe(apiKeyEnv).catch(() => undefined);
+								json(res, 200, { ok: true, apiKeyEnv, credential: credential ?? { configured: false, writable: true } });
+							} catch (error) {
+								json(res, 500, { ok: false, error: { code: "credential-unset-failed", message: safeMessage(error) } });
+							}
+							return;
+						}
+						if (req.method !== "POST") {
+							json(res, 405, { ok: false, error: { code: "method-not-allowed", message: "仅支持 GET/POST/DELETE" } });
+							return;
+						}
+						let body;
+						try {
+							body = await readJsonBody(req);
+						} catch (error) {
+							json(res, 400, { ok: false, error: { code: "invalid-body", message: safeMessage(error) } });
+							return;
+						}
+						const value = typeof body.value === "string" ? body.value.trim() : "";
+						if (value.length === 0) {
+							json(res, 400, { ok: false, error: { code: "empty-credential", message: "API Key 不能为空" } });
+							return;
+						}
+						try {
+							await credentials.set(apiKeyEnv, value);
+							lastProbe = undefined;
+							const credential = await credentials.describe(apiKeyEnv).catch(() => undefined);
+							json(res, 200, { ok: true, apiKeyEnv, credential: credential ?? { configured: false, writable: true } });
+						} catch (error) {
+							json(res, 500, { ok: false, error: { code: "credential-write-failed", message: safeMessage(error) } });
+						}
+					}
+				}),
+			"manus-llm: credential route"
+		);
 	});
 
-	// Live-reload: a volatile settings write re-derives nothing structural here
-	// (the adapter re-reads resolveConfig() per dispatch), so no rebuild is
-	// needed. This handler exists to mirror the proven pattern and keep future
-	// structural decisions cheap to add.
+	// A volatile settings write re-derives nothing structural here: the
+	// adapter re-reads `resolveConfig()` on every dispatch. The handler
+	// exists so future structural changes have an obvious hook.
 	ctx.on("loader/volatile-update", () => {});
 
-	ctx.effect(() => () => {
-		// Adapter registration is disposed with the fiber by ctx.effect inside
-		// registerAdapter; nothing extra to release here.
-	}, "manus-llm: lifetime");
+	ctx.effect(() => () => {}, "manus-llm: lifetime");
 }

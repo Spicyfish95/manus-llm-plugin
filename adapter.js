@@ -32,7 +32,7 @@ export const MANUS_API_BASE = "https://api.manus.ai";
 /** Read a validated string field from provider JSON, or throw MALFORMED_RESPONSE. */
 function needString(value, what) {
 	if (typeof value !== "string" || value.length === 0) {
-		throw new LlmError(`Manus API: expected non-empty string for ${what}`, "MALFORMED_RESPONSE");
+		throw new LlmError(`Manus 返回的数据缺少有效字段「${what}」，请稍后重试。`, "MALFORMED_RESPONSE");
 	}
 	return value;
 }
@@ -61,12 +61,43 @@ function classifyError(status, code, message) {
 	return status === undefined ? "SERVER" : `HTTP_${status}`;
 }
 
+/** User-facing Chinese hint for one failure class (shown in the conversation). */
+function hintFor(code, detail) {
+	const suffix = typeof detail === "string" && detail.length > 0 ? `（${detail}）` : "";
+	switch (code) {
+		case "MISSING_CREDENTIAL":
+			return "Manus 未配置 API Key：请打开「设置 → Manus」页面，在「账号」标签填入 API Key 后重试。";
+		case "AUTH":
+			return `Manus API Key 无效或已过期，请在「设置 → Manus」页面更新后重试${suffix}。`;
+		case "QUOTA":
+			return `Manus 积分不足，请充值后重试${suffix}。`;
+		case "RATE_LIMIT":
+			return `Manus 请求过于频繁，请稍后重试${suffix}。`;
+		case "TIMEOUT":
+			return `Manus 任务超时未返回结果${suffix}，可稍后重试或调高「任务最长等待」设置。`;
+		case "INVALID_REQUEST":
+			return `Manus 拒绝了本次请求${suffix}，请检查输入后重试。`;
+		case "SERVER":
+			return `Manus 服务异常${suffix}，请稍后重试。`;
+		case "TRANSPORT":
+			return `无法连接 Manus 服务${suffix}，请检查网络后重试。`;
+		case "ABORTED":
+			return "已取消本次 Manus 请求。";
+		case "EMPTY_RESPONSE":
+			return `Manus 没有返回任何内容${suffix}，请重试。`;
+		case "MALFORMED_RESPONSE":
+			return `Manus 返回了无法识别的数据${suffix}，请稍后重试。`;
+		default:
+			return `Manus 请求失败${suffix}，请稍后重试。`;
+	}
+}
+
 /** Build a provider-neutral LlmError from an HTTP response body. */
 function providerError(status, raw, requestId) {
 	const envelope = errorEnvelope(raw);
-	const message = envelope?.message ?? `Manus API request failed (HTTP ${status})`;
-	const code = classifyError(status, envelope?.code ?? "", message);
-	return new LlmError(`manus: ${message}`, code, {
+	const detail = envelope?.message ?? `HTTP ${status}`;
+	const code = classifyError(status, envelope?.code ?? "", detail);
+	return new LlmError(hintFor(code, detail), code, {
 		status,
 		...(requestId ? { requestId } : {})
 	});
@@ -102,14 +133,14 @@ async function requestJson(url, init, signal, timeoutMs) {
 		return raw;
 	} catch (error) {
 		if (error instanceof LlmError) throw error;
-		if (signal?.aborted) throw new LlmError("Manus request aborted", "ABORTED", { cause: error });
+		if (signal?.aborted) throw new LlmError(hintFor("ABORTED"), "ABORTED", { cause: error });
 		if (error instanceof Error && error.name === "TimeoutError") {
-			throw new LlmError("Manus request timed out", "TIMEOUT", { cause: error });
+			throw new LlmError(hintFor("TIMEOUT"), "TIMEOUT", { cause: error });
 		}
 		if (effective !== signal && effective?.reason instanceof Error && effective.reason.name === "TimeoutError") {
-			throw new LlmError("Manus request timed out", "TIMEOUT", { cause: error });
+			throw new LlmError(hintFor("TIMEOUT"), "TIMEOUT", { cause: error });
 		}
-		throw new LlmError("Manus transport failed", "TRANSPORT", { cause: error });
+		throw new LlmError(hintFor("TRANSPORT", error instanceof Error ? error.message : undefined), "TRANSPORT", { cause: error });
 	}
 }
 
@@ -160,11 +191,11 @@ const sleep = (ms, signal) => new Promise((resolve, reject) => {
 	if (signal) {
 		const onAbort = () => {
 			clearTimeout(timer);
-			reject(new LlmError("Manus request aborted", "ABORTED"));
+			reject(new LlmError(hintFor("ABORTED"), "ABORTED"));
 		};
 		if (signal.aborted) {
 			clearTimeout(timer);
-			reject(new LlmError("Manus request aborted", "ABORTED"));
+			reject(new LlmError(hintFor("ABORTED"), "ABORTED"));
 		} else signal.addEventListener("abort", onAbort, { once: true });
 	}
 });
@@ -244,8 +275,9 @@ var ManusAdapter = class extends LlmAdapter {
 			name: known?.name ?? model,
 			description: known?.description,
 			// Manus runs a cloud agent, so the harness's own context budget is a
-			// reporting figure, not a hard provider limit.
-			context: { contextWindow: config.contextWindow },
+			// reporting figure, not a hard provider limit. Each tier carries its
+			// own configured window (200k / 500k / 1M).
+			context: { contextWindow: config.contextWindowOf(model) },
 			defaultMaxTokens: config.maxTokens,
 			inputModalities: ["text"],
 			// Only the `max` tier offers deeper thinking levels; the others have
@@ -307,14 +339,42 @@ var ManusAdapter = class extends LlmAdapter {
 		};
 	}
 
+	/**
+	 * One connection probe for the settings page: a single read-only call that
+	 * proves the key works and reports the current balance. Unlike
+	 * `fetchCredits` it surfaces the failure code instead of swallowing it.
+	 * @returns {Promise<{ok: boolean, total?: number, code?: string, message?: string}>}
+	 */
+	async probe(apiKey, timeoutMs = 15000) {
+		try {
+			const raw = await requestJson(`${MANUS_API_BASE}/v2/usage.availableCredits`, {
+				method: "GET",
+				headers: {
+					...attributionHeaders(),
+					"x-manus-api-key": apiKey,
+					accept: "application/json"
+				}
+			}, undefined, timeoutMs);
+			const data = isObject(raw.data) ? raw.data : undefined;
+			const total = typeof data?.total_credits === "number" ? data.total_credits : undefined;
+			if (total === undefined) {
+				return { ok: false, code: "MALFORMED_RESPONSE", message: "Manus 返回了无法识别的余额数据" };
+			}
+			return { ok: true, total };
+		} catch (error) {
+			return {
+				ok: false,
+				code: error instanceof LlmError ? error.code : "TRANSPORT",
+				message: error instanceof Error ? error.message : String(error)
+			};
+		}
+	}
+
 	async *generate(options) {
 		const config = this.resolveConfig();
 		const apiKey = await this.resolveApiKey(config.apiKeyEnv);
 		if (!apiKey || apiKey.length === 0) {
-			throw new LlmError(
-				`manus: no API key configured; set the key "${config.apiKeyEnv}" through the credentials store (web Models page) or the launching environment`,
-				"MISSING_CREDENTIAL"
-			);
+			throw new LlmError(hintFor("MISSING_CREDENTIAL"), "MISSING_CREDENTIAL");
 		}
 		const signal = options.signal;
 		signal?.throwIfAborted?.();
@@ -336,7 +396,7 @@ var ManusAdapter = class extends LlmAdapter {
 
 		const prompt = taskId === undefined ? firstTurnPrompt(options) : followUpPrompt(options);
 		if (prompt.length === 0) {
-			throw new LlmError("manus: request produced an empty prompt", "INVALID_REQUEST");
+			throw new LlmError(hintFor("INVALID_REQUEST", "输入内容为空"), "INVALID_REQUEST");
 		}
 		// One tier decision per turn: a deeper reasoning effort under the `max`
 		// route IS the agent_profile value; every other route keeps its tier.
@@ -400,7 +460,7 @@ var ManusAdapter = class extends LlmAdapter {
 					headers,
 					body: JSON.stringify({ task_id: taskId })
 				}, undefined, 15000).catch(() => {});
-				throw new LlmError(`manus: task ${taskId} did not finish within ${config.pollMaxSeconds}s`, "TIMEOUT");
+				throw new LlmError(hintFor("TIMEOUT", `已等待 ${config.pollMaxSeconds} 秒`), "TIMEOUT");
 			}
 			const params = new URLSearchParams({
 				task_id: taskId,
@@ -445,7 +505,7 @@ var ManusAdapter = class extends LlmAdapter {
 						const detail = typeof status?.status_detail?.waiting_description === "string"
 							? status.status_detail.waiting_description
 							: typeof status?.description === "string" ? status.description : "Manus agent reported an error";
-						throw new LlmError(`manus: task ${taskId} failed: ${detail}`, "SERVER");
+						throw new LlmError(hintFor("SERVER", detail), "SERVER");
 					}
 					if (agentStatus === "stopped") {
 						// Close the open block and settle the turn.
@@ -454,7 +514,7 @@ var ManusAdapter = class extends LlmAdapter {
 							// visible path skipped. Only a task that produced no text at
 							// all is a genuinely empty turn.
 							if (fallbackText.length === 0) {
-								throw new LlmError(`manus: task ${taskId} finished with no content`, "EMPTY_RESPONSE");
+								throw new LlmError(hintFor("EMPTY_RESPONSE"), "EMPTY_RESPONSE");
 							}
 							blockIndex += 1;
 							blockText = fallbackText;
@@ -509,7 +569,7 @@ var ManusAdapter = class extends LlmAdapter {
 					const detail = typeof payload?.content === "string" && payload.content.length > 0
 						? payload.content
 						: typeof payload?.error_type === "string" ? payload.error_type : "Manus reported an error";
-					throw new LlmError(`manus: task ${taskId} error: ${detail}`, "SERVER");
+					throw new LlmError(hintFor("SERVER", detail), "SERVER");
 				}
 				// user_message / tool_used / plan_update / explanation: ignored.
 			}
