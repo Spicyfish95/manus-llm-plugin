@@ -36,6 +36,10 @@ const PROVIDER = "manus";
 /** Plugin-owned credit route consumed by the browser half. */
 const CREDITS_PATH = "/plugins/manus-llm/credits";
 
+/** Plugin-owned settings routes consumed by the settings-dialog page. */
+const CONFIG_PATH = "/plugins/manus-llm/config";
+const CREDENTIAL_PATH = "/plugins/manus-llm/credential";
+
 /**
  * Reasoning efforts offered under the `max` model. Every id is a valid
  * `agent_profile` value, and `max` is the plain default thinking level
@@ -43,7 +47,7 @@ const CREDITS_PATH = "/plugins/manus-llm/credits";
  * rewriting on the wire.
  */
 const REASONING_EFFORTS = [
-	{ id: "max", name: "默认", description: "Max 默认思考等级（Manus 的 max 档默认值）。" },
+	{ id: "max", name: "default", description: "Max 档的默认思考等级（对应 Manus 的 max 档默认值）。" },
 	{ id: "max-medium", name: "中", description: "Max 档，中等思考深度。" },
 	{ id: "max-high", name: "高", description: "Max 档，较高思考深度。" },
 	{ id: "max-extra", name: "增强", description: "Max 档，更强思考深度（耗时与积分更高）。" },
@@ -148,6 +152,36 @@ function safeMessage(error) {
 		.replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gu, "[redacted token]")
 		.slice(0, 300);
 }
+
+/** Read a small JSON body from a plugin route request. */
+async function readJsonBody(req, limitBytes = 8192) {
+	const chunks = [];
+	let total = 0;
+	for await (const chunk of req) {
+		total += chunk.length;
+		if (total > limitBytes) throw new Error("request body too large");
+		chunks.push(chunk);
+	}
+	if (total === 0) return {};
+	const raw = Buffer.concat(chunks).toString("utf8");
+	const parsed = JSON.parse(raw);
+	return parsed !== null && typeof parsed === "object" ? parsed : {};
+}
+
+/** The volatile field names the settings page may write. */
+const WRITABLE_FIELDS = new Set([
+	"apiKeyEnv",
+	"defaultProfile",
+	"locale",
+	"pollIntervalMs",
+	"pollMaxSeconds",
+	"requestTimeoutMs",
+	"contextWindow",
+	"maxTokens",
+	"trackCredits",
+	"showProgress",
+	"verboseEvents"
+]);
 
 export function apply(ctx, config) {
 	const entryId = ctx.fiber?.entry?.options?.id ?? name;
@@ -283,6 +317,144 @@ export function apply(ctx, config) {
 				}
 			}
 		}), "manus-llm: credits route");
+	});
+
+	/**
+	 * Settings-dialog routes. The plugin's own settings page reads and writes
+	 * through these instead of the Remote settings/credentials namespaces, so
+	 * the browser bundle needs no `remote.*` declaration (the pattern
+	 * dsh-skills-manager and dsh-connect-trae already ship).
+	 *
+	 * Writes go through `settings.mutate` — the same volatile-gated path the
+	 * Models page uses — so the schema's volatility rules stay the single
+	 * authority and a stale revision reports a conflict instead of clobbering.
+	 */
+	ctx.inject(["webServer"], (webCtx) => {
+		webCtx.effect(() => webCtx.webServer.register({
+			kind: "exact",
+			path: CONFIG_PATH,
+			handler: async (req, res) => {
+				if (!loopbackOrigin(req)) return json(res, 403, { ok: false, error: { code: "origin-not-trusted" } });
+				const settings = ctx.get("settings");
+				const credentials = ctx.get("credentials");
+				const apiKeyEnv = unwrap(config.apiKeyEnv, "MANUS_API_KEY");
+
+				if (req.method === "GET") {
+					let revision;
+					try {
+						revision = settings?.describe?.()?.find?.((row) => row.ns === entryId)?.revision;
+					} catch {
+						revision = undefined;
+					}
+					let credential;
+					try {
+						credential = await credentials?.describe?.(apiKeyEnv);
+					} catch {
+						credential = undefined;
+					}
+					return json(res, 200, {
+						ok: true,
+						entryId,
+						revision,
+						credential: credential ?? { configured: false, writable: true },
+						values: {
+							apiKeyEnv,
+							defaultProfile: unwrap(config.defaultProfile, "standard"),
+							locale: unwrap(config.locale, "zh-CN"),
+							pollIntervalMs: unwrap(config.pollIntervalMs, 2000),
+							pollMaxSeconds: unwrap(config.pollMaxSeconds, 1200),
+							requestTimeoutMs: unwrap(config.requestTimeoutMs, 60000),
+							contextWindow: unwrap(config.contextWindow, 1000000),
+							maxTokens: unwrap(config.maxTokens, 32000),
+							trackCredits: unwrap(config.trackCredits, true) === true,
+							showProgress: unwrap(config.showProgress, false) === true,
+							verboseEvents: unwrap(config.verboseEvents, false) === true
+						},
+						models: MODEL_CATALOG,
+						tiers: [...TIERS],
+						reasoningEfforts: REASONING_EFFORTS
+					});
+				}
+
+				if (req.method !== "POST") return json(res, 405, { ok: false, error: { code: "method-not-allowed" } });
+				if (settings === undefined) return json(res, 503, { ok: false, error: { code: "settings-unavailable", message: "设置服务不可用" } });
+
+				let body;
+				try {
+					body = await readJsonBody(req);
+				} catch (error) {
+					return json(res, 400, { ok: false, error: { code: "invalid-body", message: safeMessage(error) } });
+				}
+
+				const ops = Array.isArray(body.ops) ? body.ops : [];
+				if (ops.length === 0) return json(res, 400, { ok: false, error: { code: "empty-ops", message: "没有需要写入的字段" } });
+				const cleaned = [];
+				for (const op of ops) {
+					const path = Array.isArray(op?.path) ? op.path : [];
+					if (path.length !== 1 || typeof path[0] !== "string" || !WRITABLE_FIELDS.has(path[0])) {
+						return json(res, 400, { ok: false, error: { code: "not-writable", message: `字段不可写：${path.join(".") || "(空)"}` } });
+					}
+					cleaned.push(op.op === "unset" ? { op: "unset", path: [path[0]] } : { op: "set", path: [path[0]], value: op.value });
+				}
+
+				try {
+					const revision = typeof body.revision === "number" ? body.revision : undefined;
+					await settings.mutate(entryId, cleaned, revision);
+					const next = settings.describe().find((row) => row.ns === entryId);
+					return json(res, 200, { ok: true, revision: next?.revision });
+				} catch (error) {
+					const conflict = error?.name === "SettingsConflictError" || /revision/i.test(String(error?.message ?? ""));
+					return json(res, conflict ? 409 : 400, {
+						ok: false,
+						error: {
+							code: conflict ? "settings-conflict" : "write-failed",
+							message: safeMessage(error)
+						}
+					});
+				}
+			}
+		}), "manus-llm: config route");
+
+		webCtx.effect(() => webCtx.webServer.register({
+			kind: "exact",
+			path: CREDENTIAL_PATH,
+			handler: async (req, res) => {
+				if (!loopbackOrigin(req)) return json(res, 403, { ok: false, error: { code: "origin-not-trusted" } });
+				const credentials = ctx.get("credentials");
+				if (credentials === undefined) return json(res, 503, { ok: false, error: { code: "credentials-unavailable", message: "凭证服务不可用" } });
+				const apiKeyEnv = unwrap(config.apiKeyEnv, "MANUS_API_KEY");
+
+				if (req.method === "GET") {
+					const described = await credentials.describe(apiKeyEnv);
+					return json(res, 200, { ok: true, apiKeyEnv, credential: described });
+				}
+
+				if (req.method === "DELETE" || (req.method === "POST" && new URL(req.url ?? "/", "http://localhost").searchParams.get("action") === "clear")) {
+					try {
+						await credentials.unset(apiKeyEnv);
+						return json(res, 200, { ok: true, apiKeyEnv, credential: await credentials.describe(apiKeyEnv) });
+					} catch (error) {
+						return json(res, 500, { ok: false, error: { code: "credential-unset-failed", message: safeMessage(error) } });
+					}
+				}
+
+				if (req.method !== "POST") return json(res, 405, { ok: false, error: { code: "method-not-allowed" } });
+				let body;
+				try {
+					body = await readJsonBody(req);
+				} catch (error) {
+					return json(res, 400, { ok: false, error: { code: "invalid-body", message: safeMessage(error) } });
+				}
+				const value = typeof body.value === "string" ? body.value.trim() : "";
+				if (value.length === 0) return json(res, 400, { ok: false, error: { code: "empty-credential", message: "API Key 不能为空" } });
+				try {
+					await credentials.set(apiKeyEnv, value);
+					return json(res, 200, { ok: true, apiKeyEnv, credential: await credentials.describe(apiKeyEnv) });
+				} catch (error) {
+					return json(res, 500, { ok: false, error: { code: "credential-write-failed", message: safeMessage(error) } });
+				}
+			}
+		}), "manus-llm: credential route");
 	});
 
 	// Live-reload: a volatile settings write re-derives nothing structural here

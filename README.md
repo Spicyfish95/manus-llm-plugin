@@ -23,12 +23,12 @@
 
 ## 配置
 
-全部字段在「设置 → 模型」页（Manus 卡片）里可改，也可在 `cordis.patch.yml`（或 profile 的 patch 层）中覆盖：
+推荐在「设置 → Manus」页（本插件自己的设置页）里配置：API Key、默认档位、语言、轮询与超时、积分追踪等。全部字段也都可在 `cordis.patch.yml`（或 profile 的 patch 层）中覆盖：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `apiKeyEnv` | `MANUS_API_KEY` | 凭证引用名；通过 Web Models 页或启动环境写入 |
-| `defaultProfile` | `standard` | 未知模型 id 的回退档位（standard/lite/max） |
+| `apiKeyEnv` | `MANUS_API_KEY` | 凭证引用名；通过「设置 → Manus」页写入凭证存储 |
+| `defaultProfile` | `max` | 未知模型 id 的回退档位（standard/lite/max） |
 | `locale` | `zh-CN` | 任务输出语言 |
 | `pollIntervalMs` | `2000` | 轮询间隔（毫秒） |
 | `pollMaxSeconds` | `1200` | 单回合轮询上限，超时将 `task.stop` 并以 TIMEOUT 失败 |
@@ -43,7 +43,7 @@
 1. 打开 [Manus Developers 设置](https://manus.im/app#settings/developers)。
 2. **Create API Key**，复制（仅显示一次）。
 3. 任选其一：
-   - 「设置 → 模型」页选择 Manus 提供方并粘贴 Key（写入凭证存储，推荐）；或
+   - 打开 DSH「设置 → Manus」页，粘贴 Key 后点「保存」（写入凭证存储，推荐）；或
    - 在 `$DSH_HOME/.env` 写入 `MANUS_API_KEY=...`；或
    - 启动环境导出 `MANUS_API_KEY`。
 
@@ -51,4 +51,9 @@
 
 ## 浏览器端
 
-`client.js` 在对话输入区注册两处积分读数（`conversation.input.left` 与 `conversation.composer.dock`），仅在当前模型是 `manus/*` 时出现。它只调用插件自己的只读路由 `/plugins/manus-llm/credits`（仅本机回环可访问），API Key 始终留在 Host 侧。
+`client.js` 提供两块界面：
+
+1. **对话工具栏积分读数**（`conversation.input.left` 与 `conversation.composer.dock`），仅在当前模型是 `manus/*` 时出现，显示余额与「上轮消耗」，点开看分项（赠送/周期/加购/下次刷新时间）。它只调用插件自己的只读路由 `/plugins/manus-llm/credits`（仅本机回环可访问）。
+2. **「设置 → Manus」配置页**（`settings.section`，位于「技能」之后、「市场」之前），可改 API Key、默认档位、语言、轮询/超时/上下文与积分追踪开关。页面通过插件自己的 Host 路由 `/plugins/manus-llm/config`（读/写配置）与 `/plugins/manus-llm/credential`（读/写/清除 Key）工作，因此浏览器端不声明 `remote.*` 命名空间。
+
+API Key 始终留在 Host 侧的凭证存储中，浏览器端只会拿到「已配置/未配置」与来源，不会拿到明文。

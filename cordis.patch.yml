@@ -3,7 +3,7 @@
       name: 'dsh-manus-llm'
       config:
         apiKeyEnv: MANUS_API_KEY
-        defaultProfile: standard
+        defaultProfile: max
         locale: zh-CN
         pollIntervalMs: 2000
         pollMaxSeconds: 1200
