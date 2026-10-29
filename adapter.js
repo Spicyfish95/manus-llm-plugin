@@ -1,5 +1,5 @@
 /**
- * @local/manus-llm — Manus cloud agent as a DeepSeek Harness model provider.
+ * dsh-manus-llm — Manus cloud agent as a DeepSeek Harness model provider.
  *
  * Manus API v2 (https://api.manus.ai) runs each "task" on Manus's cloud agent.
  * This adapter bridges the Harness LLM seam (`ctx.llm.registerAdapter`) to it:
@@ -10,7 +10,10 @@
  *   harness chunks    ◄──  chunk translation              (text-delta / block / usage / finish)
  *
  * Design decisions:
- * - One provider route `manus`; "models" are Manus agent profiles (standard/lite/max…).
+ * - One provider route `manus`; "models" are Manus agent tiers (standard/lite/max).
+ *   The `max` tier advertises the deeper Max thinking levels as reasoning
+ *   efforts — their ids ARE valid `agent_profile` values, so an effort needs no
+ *   translation on the wire.
  *   A turn is one API task; a session maps to the same task across turns via the
  *   generated task_id written into the assistant replay state (durable, log-derived).
  * - Polling drives the stream: after creating/sending a message, we poll
@@ -22,6 +25,9 @@
  * - Errors map to the provider-neutral LlmError codes the retry plugin routes on.
  */
 import { LlmAdapter, LlmError, attributionHeaders, ToolCallId } from "@deepseek-ai/dsh-llm";
+
+/** Manus OpenAPI v2 origin (also the configurable-provider defaultBaseURL). */
+export const MANUS_API_BASE = "https://api.manus.ai";
 
 /** Read a validated string field from provider JSON, or throw MALFORMED_RESPONSE. */
 function needString(value, what) {
@@ -66,10 +72,22 @@ function providerError(status, raw, requestId) {
 	});
 }
 
+/**
+ * Compose the caller's cancellation with a per-request deadline. `AbortSignal
+ * .timeout` aborts with a `TimeoutError`, which the catch below maps to TIMEOUT.
+ */
+function withTimeout(signal, timeoutMs) {
+	if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return signal;
+	const deadline = AbortSignal.timeout(timeoutMs);
+	if (signal === undefined) return deadline;
+	return typeof AbortSignal.any === "function" ? AbortSignal.any([signal, deadline]) : signal;
+}
+
 /** Transport wrapper: turn fetch failures into TRANSPORT / TIMEOUT / ABORTED failures. */
-async function requestJson(url, init, signal) {
+async function requestJson(url, init, signal, timeoutMs) {
+	const effective = withTimeout(signal, timeoutMs);
 	try {
-		const response = await fetch(url, { ...init, signal, redirect: "error" });
+		const response = await fetch(url, { ...init, signal: effective, redirect: "error" });
 		const text = await response.text();
 		let raw;
 		try {
@@ -86,6 +104,9 @@ async function requestJson(url, init, signal) {
 		if (error instanceof LlmError) throw error;
 		if (signal?.aborted) throw new LlmError("Manus request aborted", "ABORTED", { cause: error });
 		if (error instanceof Error && error.name === "TimeoutError") {
+			throw new LlmError("Manus request timed out", "TIMEOUT", { cause: error });
+		}
+		if (effective !== signal && effective?.reason instanceof Error && effective.reason.name === "TimeoutError") {
 			throw new LlmError("Manus request timed out", "TIMEOUT", { cause: error });
 		}
 		throw new LlmError("Manus transport failed", "TRANSPORT", { cause: error });
@@ -148,16 +169,21 @@ const sleep = (ms, signal) => new Promise((resolve, reject) => {
 	}
 });
 
-/** Durable replay envelope: keeps the task_id so later turns continue the same task. */
-function replayState(model, taskId) {
+/**
+ * Durable replay envelope: keeps the task_id so later turns continue the same
+ * task. `blocks` must carry exactly one entry per emitted block — the assembler
+ * drops the whole envelope when the lengths disagree, which would silently
+ * start a fresh task on the next turn.
+ */
+function replayState(model, taskId, blockCount) {
 	return {
 		response: {
 			kind: "manus-task",
 			version: 1,
 			model
 		},
-		blocks: [{ type: "text", taskId }],
-		// Extension slot the manifest-validating reader tolerates: task handle.
+		blocks: Array.from({ length: Math.max(blockCount, 1) }, () => ({ type: "text" })),
+		// Task handle the reader pulls back out (the blocks entries stay opaque).
 		taskId
 	};
 }
@@ -174,10 +200,21 @@ function readReplay(message) {
 }
 
 var ManusAdapter = class extends LlmAdapter {
-	constructor(resolveConfig, log) {
+	/**
+	 * @param resolveConfig - () => live config snapshot (volatile refs unwrapped per read).
+	 * @param resolveApiKey - async (ref) => key string | undefined. Prefers the
+	 *   credentials seam (managed store the web Models page writes, then env /
+	 *   .env fallbacks), then the plain process environment.
+	 * @param log - diagnostics sink.
+	 * @param credits - optional { record(sessionId, spent) } sink; receives the
+	 *   credit delta measured across one finished turn.
+	 */
+	constructor(resolveConfig, resolveApiKey, log, credits) {
 		super();
 		this.resolveConfig = resolveConfig;
+		this.resolveApiKey = resolveApiKey;
 		this.log = log;
+		this.credits = credits;
 	}
 
 	providerInfo(provider) {
@@ -199,14 +236,67 @@ var ManusAdapter = class extends LlmAdapter {
 	}
 
 	async resolveModel(provider, model, _signal) {
-		const { models } = this.resolveConfig();
-		const known = models.find((entry) => entry.id === model);
+		const config = this.resolveConfig();
+		const known = config.models.find((entry) => entry.id === model);
 		return {
 			provider,
 			id: model,
 			name: known?.name ?? model,
-			description: known?.description
+			description: known?.description,
+			// Manus runs a cloud agent, so the harness's own context budget is a
+			// reporting figure, not a hard provider limit.
+			context: { contextWindow: config.contextWindow },
+			defaultMaxTokens: config.maxTokens,
+			inputModalities: ["text"],
+			// Only the `max` tier offers deeper thinking levels; the others have
+			// exactly one behavior, so they advertise no effort metadata at all.
+			...(model === "max" && config.reasoningEfforts.length > 0 ? {
+				reasoning: {
+					efforts: config.reasoningEfforts.map((effort) => ({
+						id: effort.id,
+						name: effort.name,
+						...(effort.description === undefined ? {} : { description: effort.description })
+					})),
+					defaultEffort: "max"
+				}
+			} : {})
 		};
+	}
+
+	/**
+	 * Read the authoritative spendable balance for one API key.
+	 * @param apiKey - resolved credential value.
+	 * @returns the balance document, or undefined when the call failed (the
+	 *   readout degrades to "unknown" instead of blocking the composer).
+	 */
+	async fetchCredits(apiKey, timeoutMs = 30000) {
+		try {
+			const raw = await requestJson(`${MANUS_API_BASE}/v2/usage.availableCredits`, {
+				method: "GET",
+				headers: {
+					...attributionHeaders(),
+					"x-manus-api-key": apiKey,
+					accept: "application/json"
+				}
+			}, undefined, timeoutMs);
+			const data = isObject(raw.data) ? raw.data : undefined;
+			if (data === undefined) return undefined;
+			const total = typeof data.total_credits === "number" ? data.total_credits : undefined;
+			if (total === undefined) return undefined;
+			return {
+				total,
+				free: typeof data.free_credits === "number" ? data.free_credits : undefined,
+				periodic: typeof data.periodic_credits === "number" ? data.periodic_credits : undefined,
+				addon: typeof data.addon_credits === "number" ? data.addon_credits : undefined,
+				refresh: typeof data.refresh_credits === "number" ? data.refresh_credits : undefined,
+				nextRefresh: typeof data.next_refresh_time === "number" && data.next_refresh_time > 0 ? data.next_refresh_time : undefined,
+				refreshInterval: typeof data.refresh_interval === "string" ? data.refresh_interval : "",
+				periodEnd: typeof data.current_period_end === "number" && data.current_period_end > 0 ? data.current_period_end : undefined
+			};
+		} catch (error) {
+			this.log(`manus: credit read failed: ${error instanceof Error ? error.message : String(error)}`);
+			return undefined;
+		}
 	}
 
 	/** Bind one generation: config re-resolution happens before each dispatch. */
@@ -219,7 +309,7 @@ var ManusAdapter = class extends LlmAdapter {
 
 	async *generate(options) {
 		const config = this.resolveConfig();
-		const apiKey = config.apiKey;
+		const apiKey = await this.resolveApiKey(config.apiKeyEnv);
 		if (!apiKey || apiKey.length === 0) {
 			throw new LlmError(
 				`manus: no API key configured; set the key "${config.apiKeyEnv}" through the credentials store (web Models page) or the launching environment`,
@@ -248,19 +338,26 @@ var ManusAdapter = class extends LlmAdapter {
 		if (prompt.length === 0) {
 			throw new LlmError("manus: request produced an empty prompt", "INVALID_REQUEST");
 		}
+		// One tier decision per turn: a deeper reasoning effort under the `max`
+		// route IS the agent_profile value; every other route keeps its tier.
+		const tier = config.tierOf(options.model, options.reasoningEffort);
+		const sessionId = typeof options.sessionId === "string" ? options.sessionId : "";
+		// Credit accounting is best-effort and never blocks a turn.
+		let beforeCredits;
+		if (config.trackCredits) beforeCredits = await this.fetchCredits(apiKey, config.requestTimeoutMs);
 		if (taskId === undefined) {
 			const body = {
 				message: { content: prompt },
-				agent_profile: config.profileOf(options.model),
+				agent_profile: tier,
 				locale: config.locale
 			};
 			const created = await requestJson(`${base}/task.create`, {
 				method: "POST",
 				headers,
 				body: JSON.stringify(body)
-			}, signal);
+			}, signal, config.requestTimeoutMs);
 			taskId = needString(created.task_id, "task_id");
-			this.log(`manus: created task ${taskId} (${options.model})`);
+			this.log(`manus: created task ${taskId} (${options.model}${tier !== options.model ? ` / ${tier}` : ""})`);
 		} else {
 			await requestJson(`${base}/task.sendMessage`, {
 				method: "POST",
@@ -269,15 +366,28 @@ var ManusAdapter = class extends LlmAdapter {
 					task_id: taskId,
 					message: { content: prompt }
 				})
-			}, signal);
+			}, signal, config.requestTimeoutMs);
 			this.log(`manus: sent follow-up to task ${taskId}`);
 		}
 
 		// Poll task.listMessages, translating new events into harness chunks.
-		let cursor; // start_event_id for the next poll.
+		// One text block per turn: Manus streams events, not blocks, so every
+		// assistant_message folds into the block opened by the first one. The
+		// block's text is accumulated here because `block-end` REPLACES the
+		// assembled text with the block it carries (an empty payload would erase
+		// the whole reply).
+		let cursor; // start_event_id for the next poll (id of the last event consumed).
 		let turnOpen = false;
 		let blockIndex = -1;
-		const usage = { inputTokens: 0, outputTokens: 0 };
+		let blockText = "";
+		// Every assistant text seen this turn, including `progress` frames that the
+		// visible block skips. If the task stops without ever opening a block (all
+		// output was progress), this is replayed as the answer instead of failing
+		// the turn with EMPTY_RESPONSE and burning the credits already spent.
+		let fallbackText = "";
+		// Manus does not report token counts; the harness only needs a usage
+		// record to close the turn, so zeros are reported deliberately.
+		const usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 		const started = Date.now();
 
 		while (true) {
@@ -289,7 +399,7 @@ var ManusAdapter = class extends LlmAdapter {
 					method: "POST",
 					headers,
 					body: JSON.stringify({ task_id: taskId })
-				}, undefined).catch(() => {});
+				}, undefined, 15000).catch(() => {});
 				throw new LlmError(`manus: task ${taskId} did not finish within ${config.pollMaxSeconds}s`, "TIMEOUT");
 			}
 			const params = new URLSearchParams({
@@ -301,24 +411,32 @@ var ManusAdapter = class extends LlmAdapter {
 			const page = await requestJson(`${base}/task.listMessages?${params.toString()}`, {
 				method: "GET",
 				headers
-			}, signal);
+			}, signal, config.requestTimeoutMs);
 			const messages = Array.isArray(page.messages) ? page.messages : [];
 			for (const event of messages) {
 				if (typeof event.id !== "string" || event.id.length === 0) continue;
-				cursor = event.id; // Inclusive restart point; we dedupe by our own cursor bookkeeping below.
+				// `start_event_id` is INCLUSIVE, so the event that ended the previous
+				// page comes back at the head of this one; ids are unique, so one
+				// identity check dedupes it.
+				if (event.id === cursor) continue;
+				cursor = event.id;
 				if (event.type === "assistant_message") {
 					const payload = isObject(event.assistant_message) ? event.assistant_message : undefined;
 					const text = typeof payload?.content === "string" ? payload.content : "";
 					if (text.length === 0) continue;
+					fallbackText += fallbackText.length === 0 ? text : `\n\n${text}`;
 					if (payload?.delivery_kind === "progress" && !config.showProgress) continue;
 					if (!turnOpen) {
 						blockIndex += 1;
+						blockText = "";
 						yield { type: "block-start", index: blockIndex, blockType: "text" };
 						turnOpen = true;
 					} else {
 						// New event in the same block: newline seam between events.
+						blockText += "\n\n";
 						yield { type: "text-delta", index: blockIndex, text: "\n\n" };
 					}
+					blockText += text;
 					yield { type: "text-delta", index: blockIndex, text };
 				} else if (event.type === "status_update") {
 					const status = isObject(event.status_update) ? event.status_update : undefined;
@@ -332,21 +450,38 @@ var ManusAdapter = class extends LlmAdapter {
 					if (agentStatus === "stopped") {
 						// Close the open block and settle the turn.
 						if (!turnOpen) {
-							// Terminal stop with zero output: EMPTY_RESPONSE is retryable.
-							throw new LlmError(`manus: task ${taskId} finished with no content`, "EMPTY_RESPONSE");
+							// Nothing visible opened: fall back to the progress frames the
+							// visible path skipped. Only a task that produced no text at
+							// all is a genuinely empty turn.
+							if (fallbackText.length === 0) {
+								throw new LlmError(`manus: task ${taskId} finished with no content`, "EMPTY_RESPONSE");
+							}
+							blockIndex += 1;
+							blockText = fallbackText;
+							yield { type: "block-start", index: blockIndex, blockType: "text" };
+							yield { type: "text-delta", index: blockIndex, text: fallbackText };
+							turnOpen = true;
 						}
-						blockIndex += 1;
 						yield {
 							type: "block-end",
-							index: blockIndex - 1,
-							block: { type: "text", text: "" }
+							index: blockIndex,
+							block: { type: "text", text: blockText }
 						};
 						usage.totalTokens = usage.inputTokens + usage.outputTokens;
 						yield { type: "usage", usage };
+						// Measure the turn's spend now that the task settled. Best-effort:
+						// a failed read only means the readout shows no delta.
+						if (beforeCredits !== undefined) {
+							const after = await this.fetchCredits(apiKey, config.requestTimeoutMs);
+							if (after !== undefined) {
+								const spent = beforeCredits.total - after.total;
+								if (Number.isFinite(spent)) this.credits?.record(sessionId, spent);
+							}
+						}
 						yield {
 							type: "finish",
 							reason: { kind: "stop" },
-							replayState: replayState(options.model, taskId)
+							replayState: replayState(options.model, taskId, blockIndex + 1)
 						};
 						return;
 					}
@@ -357,13 +492,16 @@ var ManusAdapter = class extends LlmAdapter {
 						const detail = status?.status_detail ?? {};
 						const kind = detail.waiting_for_event_type ?? "unknown";
 						const description = typeof detail.waiting_description === "string" ? detail.waiting_description : "";
+						const note = `[manus is waiting for input (${kind})${description ? `: ${description}` : ""} — reply to continue]\n`;
 						if (turnOpen) {
-							yield { type: "text-delta", index: blockIndex, text: `\n\n[manus is waiting for input (${kind})${description ? `: ${description}` : ""} — reply to continue]\n` };
+							blockText += `\n\n${note}`;
+							yield { type: "text-delta", index: blockIndex, text: `\n\n${note}` };
 						} else {
 							blockIndex += 1;
+							blockText = note;
 							yield { type: "block-start", index: blockIndex, blockType: "text" };
 							turnOpen = true;
-							yield { type: "text-delta", index: blockIndex, text: `[manus is waiting for input (${kind})${description ? `: ${description}` : ""} — reply to continue]\n` };
+							yield { type: "text-delta", index: blockIndex, text: note };
 						}
 					}
 				} else if (event.type === "error_message") {
