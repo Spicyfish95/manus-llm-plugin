@@ -13,6 +13,15 @@
  *   DELETE /plugins/manus-llm/credential         → clear the API key
  *   GET  /plugins/manus-llm/test                 → last connection probe result
  *   POST /plugins/manus-llm/test                 → run a connection probe now
+ *   GET  /plugins/manus-llm/file?sessionId=&name= → serve a file saved under
+ *                                                   <workspace>/manus-files/
+ *
+ * Generated files: the adapter downloads Manus attachments into
+ * `<workspace>/<downloadDirName>/` and registers images as durable image
+ * blocks. The `/file` route re-serves those local copies to the GUI so links
+ * keep working after Manus's signed CDN URLs expire. Workspace resolution goes
+ * through the host agent/session registries; when a session cannot be resolved
+ * the route answers 404 and the adapter keeps the signed URLs.
  *
  * Every settings field carries `.volatile()`: DSH's settings write gate
  * refuses any write to a non-volatile path, and `volatileForm` hides
@@ -20,8 +29,10 @@
  * volatile gate stays the single authority, and a stale revision surfaces as
  * a conflict instead of clobbering another window.
  */
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import z from "@deepseek-ai/schemastery";
-import { ManusAdapter, MANUS_API_BASE } from "./adapter.js";
+import { ManusAdapter, MANUS_API_BASE, DEFAULT_DOWNLOAD_DIR, sanitizeManusFileName } from "./adapter.js";
 
 export const name = "manus-llm";
 export const inject = ["llm"];
@@ -38,6 +49,37 @@ const CREDITS_PATH = "/plugins/manus-llm/credits";
 const CONFIG_PATH = "/plugins/manus-llm/config";
 const CREDENTIAL_PATH = "/plugins/manus-llm/credential";
 const TEST_PATH = "/plugins/manus-llm/test";
+const FILE_PATH = "/plugins/manus-llm/file";
+
+/** Extension → content type for the local file route. */
+const FILE_CONTENT_TYPES = {
+	".png": "image/png",
+	".jpg": "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif": "image/gif",
+	".webp": "image/webp",
+	".svg": "image/svg+xml",
+	".pdf": "application/pdf",
+	".zip": "application/zip",
+	".tar": "application/x-tar",
+	".gz": "application/gzip",
+	".7z": "application/x-7z-compressed",
+	".json": "application/json",
+	".txt": "text/plain; charset=utf-8",
+	".md": "text/markdown; charset=utf-8",
+	".csv": "text/csv; charset=utf-8",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".mp3": "audio/mpeg",
+	".mp4": "video/mp4",
+	".wav": "audio/wav"
+};
+
+/** Content types safe to render inline; everything else downloads as-is. */
+const INLINE_SAFE = new Set([
+	"image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml", "application/pdf", "text/plain; charset=utf-8", "text/markdown; charset=utf-8"
+]);
 
 /** Thinking levels of the Max tier. The id IS the wire `agent_profile`. */
 const REASONING_EFFORTS = [
@@ -127,6 +169,16 @@ export const Config = z.object({
 		.default(false)
 		.volatile()
 		.description("是否把 Manus 的中间进度消息也流式输出到对话里。"),
+	downloadAttachments: z
+		.boolean()
+		.default(true)
+		.volatile()
+		.description("是否把 Manus 生成的文件（图片、文档、压缩包等）自动下载到当前会话工作区。"),
+	downloadDirName: z
+		.string()
+		.default(DEFAULT_DOWNLOAD_DIR)
+		.volatile()
+		.description("下载文件在工作区内的子目录名，默认 manus-files。"),
 	verboseEvents: z.boolean().default(false).volatile().description("调试用：把非对话事件也写入日志。"),
 	apiKeyLabel: z
 		.string()
@@ -186,6 +238,8 @@ const WRITABLE_FIELDS = new Set([
 	"trackCredits",
 	"creditPosition",
 	"showProgress",
+	"downloadAttachments",
+	"downloadDirName",
 	"verboseEvents",
 	"apiKeyLabel"
 ]);
@@ -229,6 +283,8 @@ export function apply(ctx, config) {
 				? unwrap(config.creditPosition, "composer")
 				: "composer",
 			showProgress: unwrap(config.showProgress, false) === true,
+			downloadAttachments: unwrap(config.downloadAttachments, true) === true,
+			downloadDirName: downloadDirName(),
 			verboseEvents: unwrap(config.verboseEvents, false) === true,
 			apiKeyLabel: unwrap(config.apiKeyLabel, "ManusApikey01"),
 			models: MODEL_CATALOG,
@@ -280,7 +336,65 @@ export function apply(ctx, config) {
 		}
 	};
 
-	const adapter = new ManusAdapter(resolveConfig, resolveApiKey, log, credits);
+	/** Sub-directory (inside the workspace) that receives downloaded files. */
+	const downloadDirName = () => {
+		const raw = unwrap(config.downloadDirName, DEFAULT_DOWNLOAD_DIR);
+		if (typeof raw !== "string" || raw.trim().length === 0) return DEFAULT_DOWNLOAD_DIR;
+		// One path segment only: a settings value must not escape the workspace.
+		const segment = raw.trim().replace(/[\\/]+/g, "-").replace(/[<>:"|?*]/g, "_").slice(0, 64);
+		return segment.length > 0 ? segment : DEFAULT_DOWNLOAD_DIR;
+	};
+
+	/** Resolve the durable workspace directory of one session, or undefined. */
+	const resolveWorkspace = (sessionId) => {
+		if (typeof sessionId !== "string" || sessionId.length === 0) return undefined;
+		const candidates = [];
+		// Live agents registry first: that is the authoritative handle the host
+		// itself uses (claim() compares against `session.header.cwd`).
+		try {
+			const agent = ctx.get("agents")?.get?.(sessionId);
+			candidates.push(agent?.session?.header?.cwd);
+		} catch {
+			// Registry unavailable: fall through to the session store.
+		}
+		// Durable session store: survives a restart for restored sessions.
+		try {
+			const record = ctx.get("sessions")?.get?.(sessionId);
+			candidates.push(record?.header?.cwd, record?.cwd);
+		} catch {
+			// Store unavailable: no further fallback.
+		}
+		for (const candidate of candidates) {
+			if (typeof candidate === "string" && candidate.length > 0 && path.isAbsolute(candidate)) return candidate;
+		}
+		return undefined;
+	};
+
+	/**
+	 * Host-side bridge for the adapter's generated-file pipeline. Every method
+	 * is best-effort: `undefined` means "feature unavailable, keep the signed
+	 * CDN URL" and never fails a turn.
+	 */
+	const workspaceBridge = {
+		resolveWorkspace,
+		async saveImage({ data, mediaType, name }) {
+			try {
+				const attachments = ctx.get("attachments");
+				if (attachments?.saveImages === undefined) return undefined;
+				const refs = await attachments.saveImages([{ data, mediaType, ...(name === undefined ? {} : { name }) }]);
+				return Array.isArray(refs) && refs.length > 0 ? refs[0] : undefined;
+			} catch (error) {
+				ctx.logger?.info?.(`manus: image registration failed: ${error instanceof Error ? error.message : String(error)}`);
+				return undefined;
+			}
+		},
+		fileUrl(sessionId, fileName) {
+			const params = new URLSearchParams({ sessionId: sessionId ?? "", name: fileName });
+			return `${FILE_PATH}?${params.toString()}`;
+		}
+	};
+
+	const adapter = new ManusAdapter(resolveConfig, resolveApiKey, log, credits, workspaceBridge);
 	ctx.llm.registerAdapter([PROVIDER], adapter);
 
 	ctx.llm.registerConfigurableProviders([
@@ -485,6 +599,8 @@ export function apply(ctx, config) {
 									trackCredits: conf.trackCredits,
 									creditPosition: conf.creditPosition,
 									showProgress: conf.showProgress,
+									downloadAttachments: conf.downloadAttachments,
+									downloadDirName: conf.downloadDirName,
 									verboseEvents: conf.verboseEvents,
 									apiKeyLabel: conf.apiKeyLabel
 								},
@@ -555,6 +671,68 @@ export function apply(ctx, config) {
 					}
 				}),
 			"manus-llm: config route"
+		);
+
+		webCtx.effect(
+			() =>
+				webCtx.webServer.register({
+					kind: "exact",
+					path: FILE_PATH,
+					handler: async (req, res) => {
+						if (req.method !== "GET" && req.method !== "HEAD") {
+							json(res, 405, { ok: false, error: { code: "method-not-allowed", message: "仅支持 GET/HEAD" } });
+							return;
+						}
+						if (!loopbackOrigin(req)) {
+							json(res, 403, { ok: false, error: { code: "origin-not-trusted", message: "仅允许本机访问" } });
+							return;
+						}
+						const url = new URL(req.url ?? "/", "http://localhost");
+						const sessionId = url.searchParams.get("sessionId") ?? "";
+						const requested = url.searchParams.get("name") ?? "";
+						// The name must be exactly the sanitized single-segment form
+						// the adapter wrote; anything else is a traversal attempt.
+						const fileName = sanitizeManusFileName(requested, "");
+						if (fileName.length === 0 || fileName !== requested) {
+							json(res, 400, { ok: false, error: { code: "invalid-name", message: "文件名无效" } });
+							return;
+						}
+						const workspace = resolveWorkspace(sessionId);
+						if (workspace === undefined) {
+							json(res, 404, { ok: false, error: { code: "workspace-unresolved", message: "无法定位该会话的工作区" } });
+							return;
+						}
+						const dir = path.join(workspace, downloadDirName());
+						const filePath = path.join(dir, fileName);
+						// Defense in depth: the resolved path must stay inside the dir.
+						if (!filePath.startsWith(dir + path.sep)) {
+							json(res, 400, { ok: false, error: { code: "invalid-name", message: "文件名无效" } });
+							return;
+						}
+						let data;
+						try {
+							data = await readFile(filePath);
+						} catch {
+							json(res, 404, { ok: false, error: { code: "file-not-found", message: "文件不存在或已被移除" } });
+							return;
+						}
+						const ext = path.extname(fileName).toLowerCase();
+						const contentType = FILE_CONTENT_TYPES[ext] ?? "application/octet-stream";
+						const inline = INLINE_SAFE.has(contentType) && url.searchParams.get("download") !== "1";
+						res.writeHead(200, {
+							"content-type": contentType,
+							"content-length": String(data.length),
+							"content-disposition": `${inline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+							// Same posture as the harness's own file routes: a served
+							// document must never execute in the GUI origin.
+							"content-security-policy": "sandbox; default-src 'none'",
+							"x-content-type-options": "nosniff",
+							"cache-control": "private, max-age=300"
+						});
+						res.end(req.method === "HEAD" ? undefined : data);
+					}
+				}),
+			"manus-llm: file route"
 		);
 
 		webCtx.effect(

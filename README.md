@@ -37,6 +37,8 @@
 | `trackCredits` | `true` | 是否记录每轮积分消耗（工具栏「上轮消耗」依赖它） |
 | `creditPosition` | `composer` | 积分读数位置：`composer` 对话工具栏内 / `dock` 工具栏下方 |
 | `showProgress` | `false` | 是否把 Manus 的 progress 中间消息并入输出 |
+| `downloadAttachments` | `true` | 是否把 Manus 生成的文件自动下载到会话工作区 |
+| `downloadDirName` | `manus-files` | 下载文件在工作区内的子目录名 |
 | `verboseEvents` | `false` | 轮询事件逐条写日志（调试用） |
 
 ## API Key 获取
@@ -62,6 +64,14 @@
 
 Manus 模型失败时的报错为中文，按错误类型给出处置建议（未配置 Key / Key 失效 / 积分不足 / 限流 / 超时 / 服务异常 / 网络不可达 / 空回复等）。
 
-**生成文件（图片 / 文档 / 压缩包等）的回传**：Manus 云端生成的文件在 `assistant_message.content` 里以执行环境路径出现（如 `![img](/home/ubuntu/x.png)`），可下载的签名 URL 在同消息的 `attachments[]`。插件按官方 Attachments 规范做了重写：环境路径匹配 `attachments[].path`（一次 URL 解码后比对，含空格文件名）→ 替换为签名 CDN URL；非图片附件的链接文字替换为文件名；http(s) 目标原样保留；无法解析的路径节点与未知协议节点按规范剔除。因此 DSH 对话中可以直接看到 Manus 生成的图片并下载文档/压缩包。注意签名 URL 是临时的，过期后重新拉取消息即可刷新。
+**生成文件（图片 / 文档 / 压缩包等）自动下载到工作区**：Manus 云端生成的文件在 `assistant_message.content` 里以执行环境路径出现（如 `![img](/home/ubuntu/x.png)`），可下载的签名 URL 在同消息的 `attachments[]`。插件分两步处理：
+
+1. **重写链接**：环境路径匹配 `attachments[].path`（一次 URL 解码后比对，含空格文件名）→ 替换为签名 CDN URL；非图片附件的链接文字替换为文件名；http(s) 目标原样保留；无法解析的路径节点与未知协议节点按规范剔除。
+2. **落盘 + 展示**（`downloadAttachments` 打开时，默认打开）：回合结束时把每个附件下载到 `<会话工作区>/<downloadDirName>/`（默认 `manus-files`，文件名做路径分隔符与非法字符清洗、重名自动加序号），并在回复末尾追加「已保存 N 个文件到工作区」的本地绝对路径清单。
+   - 图片：注册为 Harness 的持久 image block（`ctx.attachments.saveImages`），对话里直接以图片缩略图渲染；正文里对应的 markdown 图片节点被移除，避免重复。
+   - 文档 / 压缩包等：链接改为同源只读路由 `/plugins/manus-llm/file?sessionId=&name=`，点击即可从本地副本下载（签名 CDN URL 过期后仍可用）。
+   - 下载失败（网络错误、工作区无法解析、超过大小上限等）不会让本轮失败：退回签名 URL 链接，只记一条日志。
+
+签名 URL 是临时的，过期后重新拉取消息即可刷新；已落盘的文件不受影响。
 
 API Key 始终留在 Host 侧的凭证存储中，浏览器端只会拿到「已配置/未配置」与来源，不会拿到明文。

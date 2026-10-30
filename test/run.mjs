@@ -2,7 +2,18 @@
 // of the Manus v2 API (task.create / task.sendMessage / task.listMessages /
 // usage.availableCredits).
 import http from "node:http";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { ManusAdapter } from "../adapter.js";
+
+// Mock CDN bodies for the workspace-download mode: the signed URLs in
+// `attachments[]` point at https://cdn.test/<name> and are served from here.
+const CDN_BODIES = new Map([
+	["img.png", Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d])],
+	["report.pdf", Buffer.from("%PDF-1.4\n%fake report\n")],
+	["bundle.zip", Buffer.from("PK\u0003\u0004 fake zip\n")]
+]);
 
 // Mock mode switch: 'normal' streams progress + result with a paginated page
 // boundary; 'progressOnly' produces only progress frames then stops.
@@ -17,6 +28,19 @@ const server = http.createServer((req, res) => {
 	req.on("data", (chunk) => { body += chunk; });
 	req.on("end", () => {
 		const url = new URL(req.url, "http://localhost");
+		if (req.method === "GET" && url.pathname.startsWith("/cdn/")) {
+			const name = url.pathname.slice("/cdn/".length);
+			const body = CDN_BODIES.get(name);
+			if (body === undefined) {
+				res.statusCode = 404;
+				res.end("not found");
+				return;
+			}
+			res.setHeader("content-type", "application/octet-stream");
+			res.setHeader("content-length", String(body.length));
+			res.end(body);
+			return;
+		}
 		res.setHeader("content-type", "application/json");
 		if (req.method === "POST" && url.pathname === "/v2/task.create") {
 			createBody = JSON.parse(body);
@@ -64,6 +88,67 @@ const server = http.createServer((req, res) => {
 						messages: [{ id: "p3", type: "status_update", timestamp: 3, status_update: { agent_status: "stopped" } }],
 						has_more: false
 					}));
+				}
+				return;
+			}
+			if (mode === "imageOnly") {
+				// A message whose ONLY content is an image markdown node: the node is
+				// dropped (the durable block carries the picture), so text is empty
+				// and the turn must still emit the image block at index 0 and a
+				// footnote text block at index 1.
+				if (!cursor) {
+					res.end(JSON.stringify({
+						ok: true,
+						task_id: "task_abc123",
+						messages: [
+							{
+								id: "i1",
+								type: "assistant_message",
+								timestamp: 2,
+								assistant_message: {
+									content: "![pic](/home/ubuntu/only.png)",
+									attachments: [
+										{ type: "file", filename: "only.png", content_type: "image/png", path: "/home/ubuntu/only.png", url: "https://cdn.test/img.png", file_uid: "fu1", version_uid: "vu1" }
+									]
+								}
+							},
+							{ id: "i2", type: "status_update", timestamp: 3, status_update: { agent_status: "stopped" } }
+						],
+						has_more: false
+					}));
+				} else {
+					res.end(JSON.stringify({ ok: true, task_id: "task_abc123", messages: [], has_more: false }));
+				}
+				return;
+			}
+			if (mode === "attachmentsMulti") {
+				// Two assistant messages in one turn: the first carries an image
+				// attachment, the second continues the answer as text. This is the
+				// shape that catches "text deltas written into the image block's
+				// index" — the open text block must keep its own index.
+				if (!cursor) {
+					res.end(JSON.stringify({
+						ok: true,
+						task_id: "task_abc123",
+						messages: [
+							{
+								id: "m1",
+								type: "assistant_message",
+								timestamp: 2,
+								assistant_message: {
+									content: "First part: ![pic](/home/ubuntu/pic.png)",
+									attachments: [
+										{ type: "file", filename: "pic.png", content_type: "image/png", path: "/home/ubuntu/pic.png", url: "https://cdn.test/img.png", file_uid: "fu1", version_uid: "vu1" }
+									]
+								}
+							},
+							{ id: "m2", type: "assistant_message", timestamp: 3, assistant_message: { content: "Second part continues here." } },
+							{ id: "m3", type: "status_update", timestamp: 4, status_update: { agent_status: "stopped" } }
+						],
+						has_more: false
+					}));
+				} else {
+					res.end(JSON.stringify({ ok: true, task_id: "task_abc123", messages: [], has_more: false }));
 				}
 				return;
 			}
@@ -145,6 +230,11 @@ globalThis.fetch = async (input, init) => {
 		const rewritten = url.replace("https://api.manus.ai", `http://127.0.0.1:${port}`);
 		return realFetch(rewritten, init);
 	}
+	// Signed CDN downloads: serve the in-memory bodies instead of the network.
+	if (url.startsWith("https://cdn.test/")) {
+		const rewritten = url.replace("https://cdn.test", `http://127.0.0.1:${port}/cdn`);
+		return realFetch(rewritten, init);
+	}
 	return realFetch(input, init);
 };
 
@@ -191,9 +281,42 @@ const adapter = new ManusAdapter(
 	credits
 );
 
-async function runTurn(options) {
+// Workspace mode: a temp dir stands in for the session workspace, and the
+// bridge mimics the host's attachment store + loopback file route.
+const WORKSPACE_ROOT = await mkdtemp(path.join(tmpdir(), "manus-ws-"));
+const imageRefs = [];
+const workspaceBridge = {
+	async resolveWorkspace(sessionId) {
+		// The "no-workspace" session exercises the degrade path.
+		return sessionId === "session-noworkspace" ? undefined : WORKSPACE_ROOT;
+	},
+	async saveImage({ data, mediaType, name }) {
+		const ref = {
+			attachmentId: `sha256:${"0".repeat(16)}`,
+			mediaType,
+			bytes: data.length,
+			width: 1,
+			height: 1,
+			name
+		};
+		imageRefs.push(ref);
+		return ref;
+	},
+	fileUrl(sessionId, fileName) {
+		return `/plugins/manus-llm/file?${new URLSearchParams({ sessionId, name: fileName }).toString()}`;
+	}
+};
+const workspaceAdapter = new ManusAdapter(
+	() => ({ ...config, downloadAttachments: true, downloadDirName: "manus-files" }),
+	async (ref) => ref === "MANUS_API_KEY" ? "test-key-123" : undefined,
+	(message) => logs.push(message),
+	credits,
+	workspaceBridge
+);
+
+async function runTurn(options, target = adapter) {
 	const chunks = [];
-	for await (const chunk of adapter.generate(options)) {
+	for await (const chunk of target.generate(options)) {
 		chunks.push(chunk);
 		if (chunk.type === "finish") break;
 	}
@@ -317,7 +440,131 @@ for (const [pass, label] of attachChecks) {
 }
 mode = "normal";
 
-// 6. Probe path: a FLAT credits body must read as a healthy connection.
+// 5b. Workspace download mode: attachments land in <workspace>/manus-files/,
+// image markdown becomes a durable image block, file links point at the
+// loopback route, and the reply ends with the saved-path footnote.
+mode = "attachments";
+creditCalls = 0;
+totalCredits = 1000;
+const turn5 = await runTurn({
+	provider: "manus",
+	model: "standard",
+	sessionId: "session-workspace",
+	messages: [userMessage("Draw a picture and pack the files.")],
+	signal: undefined
+}, workspaceAdapter);
+const wsText = textOf(turn5);
+const wsBlocks = turn5.filter((c) => c.type === "block-end").map((c) => c.block);
+const wsImages = wsBlocks.filter((block) => block.type === "image");
+const wsImageBlockEvents = turn5.filter((c) => c.type === "block-end" && c.block.type === "image");
+const wsTerminal = turn5.at(-1);
+const wsReplay = wsTerminal?.replayState;
+const wsFiles = await readdir(path.join(WORKSPACE_ROOT, "manus-files"));
+const wsChecks = [
+	[wsFiles.length === 3, `3 files saved (got ${JSON.stringify(wsFiles)})`],
+	[wsFiles.includes("image 1.png") && wsFiles.includes("report.pdf") && wsFiles.includes("bundle.zip"), "sanitized names on disk"],
+	[!wsText.includes("https://cdn.test/img.png"), "image markdown node dropped (replaced by image block)"],
+	[wsText.includes("![pic]") === false, "image markdown node gone from text"],
+	[wsText.includes("[report.pdf](/plugins/manus-llm/file?") && wsText.includes("name=report.pdf"), "doc link → loopback file route"],
+	[wsText.includes("[bundle.zip](/plugins/manus-llm/file?") && wsText.includes("name=bundle.zip"), "bare zip path → loopback file route"],
+	[wsText.includes("已保存 3 个文件到工作区"), "footnote lists saved files"],
+	[wsText.includes("manus-files") && wsText.includes("report.pdf"), "footnote carries local path"],
+	[wsImages.length === 1, `one durable image block (got ${wsImages.length})`],
+	[wsImageBlockEvents.length === 1 && wsImageBlockEvents[0].index === 1, "image block emitted block-end-only at index 1"],
+	[wsImages[0]?.attachment?.attachmentId?.startsWith("sha256:"), "image block carries an attachment ref"],
+	[wsReplay?.blocks?.length === 2 && wsReplay.blocks[0].type === "text" && wsReplay.blocks[1].type === "image", `replay envelope aligned (got ${JSON.stringify(wsReplay?.blocks)})`],
+	[wsReplay?.taskId === "task_abc123", "replay keeps the task handle"],
+	[(await readFile(path.join(WORKSPACE_ROOT, "manus-files", "report.pdf"), "utf8")).includes("fake report"), "file bytes written"]
+];
+for (const [pass, label] of wsChecks) {
+	console.log("WORKSPACE:", pass ? "ok" : "FAIL", "-", label);
+	if (!pass) process.exitCode = 1;
+}
+console.log("WORKSPACE TEXT:", JSON.stringify(wsText));
+console.log("WORKSPACE FILES:", JSON.stringify(wsFiles));
+
+// 5c. Degrade path: no resolvable workspace → signed URLs stay, no footnote,
+// no image block, and the replay envelope keeps its single text entry.
+const turn6 = await runTurn({
+	provider: "manus",
+	model: "standard",
+	sessionId: "session-noworkspace",
+	messages: [userMessage("Same attachments, no workspace.")],
+	signal: undefined
+}, workspaceAdapter);
+const degText = textOf(turn6);
+const degReplay = turn6.at(-1)?.replayState;
+const degChecks = [
+	[degText.includes("![pic](https://cdn.test/img.png)"), "image keeps signed URL"],
+	[degText.includes("[report.pdf](https://cdn.test/report.pdf)"), "doc keeps signed URL"],
+	[!degText.includes("/plugins/manus-llm/file"), "no loopback link without a workspace"],
+	[!degText.includes("已保存"), "no footnote without a workspace"],
+	[turn6.filter((c) => c.type === "block-end" && c.block.type === "image").length === 0, "no image block without a workspace"],
+	[degReplay?.blocks?.length === 1 && degReplay.blocks[0].type === "text", `replay stays text-only (got ${JSON.stringify(degReplay?.blocks)})`]
+];
+for (const [pass, label] of degChecks) {
+	console.log("DEGRADE:", pass ? "ok" : "FAIL", "-", label);
+	if (!pass) process.exitCode = 1;
+}
+mode = "normal";
+
+// 5d. Multi-message turn: an image block must not capture the text deltas
+// that arrive in the NEXT assistant message. The open text block keeps index 0
+// while the image takes index 1; "Second part…" must land on index 0.
+mode = "attachmentsMulti";
+const turn7 = await runTurn({
+	provider: "manus",
+	model: "standard",
+	sessionId: "session-workspace",
+	messages: [userMessage("Two-part answer.")],
+	signal: undefined
+}, workspaceAdapter);
+const multiDeltas = turn7.filter((c) => c.type === "text-delta");
+const multiImageBlockEnds = turn7.filter((c) => c.type === "block-end" && c.block.type === "image");
+const multiTextBlockEnd = turn7.find((c) => c.type === "block-end" && c.block.type === "text");
+const multiChecks = [
+	[multiDeltas.every((c) => c.index === 0), `all text deltas on index 0 (got ${JSON.stringify(multiDeltas.map((c) => c.index))})`],
+	[multiImageBlockEnds.length === 1 && multiImageBlockEnds[0].index === 1, "image block on its own index 1"],
+	[textOf(turn7).includes("Second part continues here."), "second message text present"],
+	[multiTextBlockEnd?.block?.text?.includes("Second part continues here."), "text block carries both parts"],
+	[!multiTextBlockEnd?.block?.text?.includes("![pic]"), "image markdown removed from text"]
+];
+for (const [pass, label] of multiChecks) {
+	console.log("MULTI:", pass ? "ok" : "FAIL", "-", label);
+	if (!pass) process.exitCode = 1;
+}
+mode = "normal";
+
+// 5e. Image-only turn: no text at all, one image attachment. The image block
+// lands at index 0 and the footnote opens a text block at index 1; the replay
+// envelope must carry both entries.
+mode = "imageOnly";
+const turn8 = await runTurn({
+	provider: "manus",
+	model: "standard",
+	sessionId: "session-workspace",
+	messages: [userMessage("Just draw it.")],
+	signal: undefined
+}, workspaceAdapter);
+const onlyBlocks = turn8.filter((c) => c.type === "block-end").map((c) => c.block);
+const onlyReplay = turn8.at(-1)?.replayState;
+const onlyChecks = [
+	[onlyBlocks.length === 2, `two blocks (got ${onlyBlocks.length})`],
+	[onlyBlocks[0]?.type === "image", "image block first"],
+	[onlyBlocks[1]?.type === "text", "footnote text block second"],
+	[onlyBlocks[1]?.text?.includes("已保存 1 个文件"), "footnote reports the single file"],
+	[onlyReplay?.blocks?.length === 2, `replay carries 2 entries (got ${JSON.stringify(onlyReplay?.blocks)})`],
+	[onlyReplay?.taskId === "task_abc123", "task handle preserved"]
+];
+for (const [pass, label] of onlyChecks) {
+	console.log("IMAGEONLY:", pass ? "ok" : "FAIL", "-", label);
+	if (!pass) process.exitCode = 1;
+}
+mode = "normal";
+
+// 5f. No-workspace degrade for a MULTI-message turn: replay must stay aligned
+// with the blocks actually emitted (text only, no image).
+await rm(WORKSPACE_ROOT, { recursive: true, force: true });
 // This is the regression for 「检测连接：Manus 返回了无法识别的余额数据」 —
 // the old parser only looked under `data` and rejected the live shape.
 creditCalls = 0;

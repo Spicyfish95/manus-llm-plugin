@@ -8,6 +8,7 @@ const chain = () => {
 		min: () => api,
 		max: () => api,
 		step: () => api,
+		description: () => api,
 		get: () => api
 	};
 	return api;

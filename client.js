@@ -33,7 +33,7 @@ window.__ModuleLoader__.load({
 			["requestTimeoutMs", 5000, 300000],
 			["maxTokens", 100, undefined]
 		];
-		const RUNTIME_BOOLEANS = ["trackCredits", "showProgress", "verboseEvents"];
+		const RUNTIME_BOOLEANS = ["trackCredits", "showProgress", "verboseEvents", "downloadAttachments"];
 
 		const zh = {
 			"credits.label": "积分",
@@ -113,6 +113,8 @@ window.__ModuleLoader__.load({
 			"settings.field.trackCredits": "统计积分消耗",
 			"settings.field.showProgress": "显示进度消息",
 			"settings.field.verboseEvents": "记录详细事件",
+			"settings.field.downloadAttachments": "自动下载生成的文件",
+			"settings.field.downloadDirName": "下载目录名",
 
 			"settings.save": "保存",
 			"settings.saved": "已保存。",
@@ -202,6 +204,8 @@ window.__ModuleLoader__.load({
 			"settings.field.trackCredits": "Track credit spend",
 			"settings.field.showProgress": "Show progress messages",
 			"settings.field.verboseEvents": "Log verbose events",
+			"settings.field.downloadAttachments": "Auto-download generated files",
+			"settings.field.downloadDirName": "Download folder name",
 
 			"settings.save": "Save",
 			"settings.saved": "Saved.",
@@ -647,7 +651,9 @@ window.__ModuleLoader__.load({
 					showProgress: values.showProgress,
 					verboseEvents: values.verboseEvents,
 					creditPosition: values.creditPosition,
-					apiKeyLabel: values.apiKeyLabel
+					apiKeyLabel: values.apiKeyLabel,
+					downloadAttachments: values.downloadAttachments,
+					downloadDirName: values.downloadDirName
 				});
 				setKeyLabel(typeof values.apiKeyLabel === "string" && values.apiKeyLabel.trim().length > 0 ? values.apiKeyLabel : "ManusApikey01");
 				const windows = values.modelContexts ?? {};
@@ -694,7 +700,7 @@ window.__ModuleLoader__.load({
 
 			const setField = (key, value) => setDraft((current) => ({ ...current, [key]: value }));
 
-			const accountKeys = ["defaultProfile", "locale", "pollIntervalMs", "pollMaxSeconds", "requestTimeoutMs", "maxTokens", "trackCredits", "showProgress", "verboseEvents", "creditPosition", "apiKeyLabel"];
+			const accountKeys = ["defaultProfile", "locale", "pollIntervalMs", "pollMaxSeconds", "requestTimeoutMs", "maxTokens", "trackCredits", "showProgress", "verboseEvents", "downloadAttachments", "downloadDirName", "creditPosition", "apiKeyLabel"];
 			const unsavedAccount = accountKeys.some((key) => draft[key] !== config.values?.[key]);
 			const unsavedModels = Object.keys(contexts).some((model) => contexts[model] !== (config.values?.modelContexts?.[model] ?? 1000000));
 
@@ -1227,6 +1233,16 @@ window.__ModuleLoader__.load({
 								})
 							}, key)
 						)
+					}),
+					jsx.jsx(Field, {
+						label: t("settings.field.downloadDirName"),
+						children: jsx.jsx("input", {
+							type: "text",
+							className: "dsm-manus-settings-control",
+							value: draft.downloadDirName ?? "",
+							placeholder: "manus-files",
+							onChange: (event) => setField("downloadDirName", event.target.value)
+						})
 					}),
 					jsx.jsx("div", {
 						className: "dsm-manus-settings-row",

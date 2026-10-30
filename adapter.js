@@ -22,8 +22,18 @@
  *   the UI shows progressive output. status_update(stopped|error) ends the turn.
  * - Tool calls are NOT supported (Manus has its own tools); we declare no tools
  *   and degrade gracefully: tool results are serialized as readable text.
+ * - Generated files: Manus returns execution-environment paths plus expiring
+ *   signed URLs in `attachments[]`. When a workspace is resolvable and
+ *   `downloadAttachments` is on, every attachment is downloaded into
+ *   `<workspace>/manus-files/`; images are additionally registered as durable
+ *   image blocks (rendered inline by the GUI) and markdown links are rewritten
+ *   to the plugin's loopback file route so they keep working after the signed
+ *   URL expires. A failed download degrades to the original signed URL — a
+ *   turn never fails because a file could not be saved.
  * - Errors map to the provider-neutral LlmError codes the retry plugin routes on.
  */
+import { access, mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { LlmAdapter, LlmError, attributionHeaders, ToolCallId } from "@deepseek-ai/dsh-llm";
 
 /** Manus OpenAPI v2 origin (also the configurable-provider defaultBaseURL). */
@@ -34,6 +44,59 @@ export const MANUS_API_BASE = "https://api.manus.ai";
  * (fetchCreditsCached). 30s matches the host-side credits-route cache.
  */
 const CREDITS_TTL_MS = 30_000;
+
+/** Default sub-directory (inside the session workspace) that receives Manus files. */
+export const DEFAULT_DOWNLOAD_DIR = "manus-files";
+
+/** Hard ceiling for one downloaded attachment (defends against runaway archives). */
+const MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024;
+
+/** Image media types the harness attachment store accepts (ImageMediaType). */
+const IMAGE_MEDIA_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+
+/** Content types the harness store accepts, mapped from Manus `content_type`. */
+function imageMediaType(contentType) {
+	if (typeof contentType !== "string" || contentType.length === 0) return undefined;
+	const normalized = contentType.trim().toLowerCase();
+	if (IMAGE_MEDIA_TYPES.has(normalized)) return normalized;
+	// Legacy spelling that browsers/APIs still emit.
+	if (normalized === "image/jpg") return "image/jpeg";
+	return undefined;
+}
+
+/** Drop everything a Windows/Unix filename cannot carry, keep unicode + spaces. */
+export function sanitizeManusFileName(raw, fallback = "manus-file") {
+	const base = typeof raw === "string" ? raw.replace(/^.*[\\/]/, "") : "";
+	const cleaned = base
+		.replace(/[\u0000-\u001f\u007f]/g, "")
+		.replace(/[<>:"|?*]/g, "_")
+		.replace(/\s+/g, " ")
+		.trim()
+		.replace(/^\.+$/, "");
+	const name = cleaned.length > 0 ? cleaned : fallback;
+	// Windows caps the whole path; keep the leaf well under 255 chars.
+	if (name.length <= 180) return name;
+	const dot = name.lastIndexOf(".");
+	const ext = dot > 0 && name.length - dot <= 12 ? name.slice(dot) : "";
+	return `${name.slice(0, 180 - ext.length)}${ext}`;
+}
+
+/** First free `<base>-2<ext>`, `<base>-3<ext>`… next to an existing file. */
+async function uniqueWorkspacePath(dir, name) {
+	const dot = name.lastIndexOf(".");
+	const stem = dot > 0 ? name.slice(0, dot) : name;
+	const ext = dot > 0 ? name.slice(dot) : "";
+	let candidate = path.join(dir, name);
+	for (let index = 2; index < 1000; index += 1) {
+		try {
+			await access(candidate);
+			candidate = path.join(dir, `${stem}-${index}${ext}`);
+		} catch {
+			return { filePath: candidate, fileName: path.basename(candidate) };
+		}
+	}
+	return { filePath: candidate, fileName: path.basename(candidate) };
+}
 
 /** Read a validated string field from provider JSON, or throw MALFORMED_RESPONSE. */
 function needString(value, what) {
@@ -221,8 +284,13 @@ function blocksToText(blocks) {
  *    cannot be resolved) while the surrounding text is preserved.
  * Attachments without a usable `path` (e.g. website checkpoints are handled
  * separately by the agent text itself) are ignored here.
+ *
+ * `displayUrls` optionally overrides the destination per attachment path —
+ * the workspace downloader points it at the plugin's loopback file route so
+ * links survive the signed URL's expiry. Its entries carry
+ * `{url, filename, contentType}` like the derived ones.
  */
-function rewriteAttachments(content, attachments) {
+function rewriteAttachments(content, attachments, displayUrls) {
 	if (typeof content !== "string" || content.length === 0) return content;
 	if (!Array.isArray(attachments) || attachments.length === 0) return content;
 	const byPath = new Map();
@@ -231,7 +299,13 @@ function rewriteAttachments(content, attachments) {
 		const path = typeof attachment.path === "string" ? attachment.path : undefined;
 		const url = typeof attachment.url === "string" ? attachment.url : undefined;
 		if (path === undefined || url === undefined || path.length === 0 || url.length === 0) continue;
-		byPath.set(path, { url, filename: typeof attachment.filename === "string" ? attachment.filename : undefined, contentType: typeof attachment.content_type === "string" ? attachment.content_type : undefined });
+		const override = displayUrls?.get(path);
+		byPath.set(path, {
+			url: typeof override?.url === "string" && override.url.length > 0 ? override.url : url,
+			filename: typeof override?.filename === "string" ? override.filename : typeof attachment.filename === "string" ? attachment.filename : undefined,
+			contentType: typeof override?.contentType === "string" ? override.contentType : typeof attachment.content_type === "string" ? attachment.content_type : undefined,
+			dropNode: override?.dropNode === true
+		});
 	}
 	if (byPath.size === 0) return content;
 	let decodedCache;
@@ -254,13 +328,14 @@ function rewriteAttachments(content, attachments) {
 		}
 	};
 	const trimTitle = (dest) => dest.replace(/\s+"[^"]*"$/, "").replace(/\s+$/, "");
-	// Images: ![alt](dest) → keep as image when resolvable (signed CDN URL).
+	// Images: ![alt](dest) → keep as image when resolvable (signed CDN URL),
+	// or drop the node when a durable image block already carries the picture.
 	// Dest may contain spaces (e.g. `/home/ubuntu/out/image 1.png`), so the
 	// capture is bounded by the closing paren, then a trailing "title" is cut.
 	let rewritten = content.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (whole, alt, dest) => {
 		const match = resolveDest(trimTitle(dest));
 		if (match === undefined) return whole;
-		if (match === null) return "";
+		if (match === null || match.dropNode === true) return "";
 		return `![${alt}](${match.url})`;
 	});
 	// Links: [text](dest) → rendered as a download link. For non-image files
@@ -269,7 +344,7 @@ function rewriteAttachments(content, attachments) {
 	rewritten = rewritten.replace(/\[([^\]]*)\]\(([^)]+)\)/g, (whole, text, dest) => {
 		const match = resolveDest(trimTitle(dest));
 		if (match === undefined) return whole;
-		if (match === null) return "";
+		if (match === null || match.dropNode === true) return "";
 		const isImageLink = match.contentType !== undefined && match.contentType.startsWith("image/");
 		const label = isImageLink || match.filename === undefined ? text : match.filename;
 		return `[${label}](${match.url})`;
@@ -279,9 +354,70 @@ function rewriteAttachments(content, attachments) {
 	// matches, otherwise leave the text alone (it is plain prose there).
 	rewritten = rewritten.replace(/(?<!\]\()((?:\/[\w.-]+){2,})(?!\))/g, (whole, envPath) => {
 		const match = byPath.get(envPath);
-		return match === undefined ? whole : `[${match.filename ?? envPath.split("/").pop()}](${match.url})`;
+		if (match === undefined) return whole;
+		if (match.dropNode === true) return "";
+		return `[${match.filename ?? envPath.split("/").pop()}](${match.url})`;
 	});
 	return rewritten;
+}
+
+/**
+ * Download one attachment body from its signed CDN URL. Unlike the JSON
+ * transport this FOLLOWS redirects (signed URLs commonly 302 to the real
+ * object) and reads bytes, with a size ceiling so a runaway archive cannot
+ * exhaust memory. `content-length` is checked up front when present; the
+ * accumulated size is checked while reading either way.
+ * @returns the body as a Buffer.
+ */
+async function downloadAttachment(url, signal, timeoutMs) {
+	const effective = withTimeout(signal, timeoutMs);
+	try {
+		const response = await fetch(url, { method: "GET", signal: effective, redirect: "follow" });
+		if (!response.ok) throw new Error(`HTTP ${response.status} from ${new URL(url).host}`);
+		const declared = Number(response.headers.get("content-length") ?? "");
+		if (Number.isFinite(declared) && declared > MAX_DOWNLOAD_BYTES) {
+			throw new Error(`file too large (${declared} bytes > ${MAX_DOWNLOAD_BYTES})`);
+		}
+		if (response.body === null) throw new Error("empty response body");
+		const chunks = [];
+		let total = 0;
+		for await (const chunk of response.body) {
+			total += chunk.length;
+			if (total > MAX_DOWNLOAD_BYTES) throw new Error(`file too large (> ${MAX_DOWNLOAD_BYTES} bytes)`);
+			chunks.push(Buffer.from(chunk));
+		}
+		return Buffer.concat(chunks);
+	} catch (error) {
+		if (error instanceof LlmError) throw error;
+		if (signal?.aborted) throw new LlmError(hintFor("ABORTED"), "ABORTED", { cause: error });
+		throw new Error(error instanceof Error ? error.message : String(error));
+	}
+}
+
+/** Content type used to pick an extension when Manus omits the filename. */
+const CONTENT_TYPE_EXTENSIONS = {
+	"image/png": ".png",
+	"image/jpeg": ".jpg",
+	"image/webp": ".webp",
+	"image/gif": ".gif",
+	"image/svg+xml": ".svg",
+	"application/pdf": ".pdf",
+	"application/zip": ".zip",
+	"application/json": ".json",
+	"text/plain": ".txt",
+	"text/markdown": ".md",
+	"text/csv": ".csv"
+};
+
+/** Give a nameless attachment a usable extension from its content type. */
+function nameForAttachment(attachment, index) {
+	const rawName = typeof attachment.filename === "string" && attachment.filename.length > 0
+		? attachment.filename
+		: typeof attachment.path === "string" && attachment.path.length > 0 ? attachment.path : "";
+	const name = sanitizeManusFileName(rawName, `manus-file-${index + 1}`);
+	if (name.includes(".")) return name;
+	const ext = CONTENT_TYPE_EXTENSIONS[typeof attachment.content_type === "string" ? attachment.content_type.toLowerCase() : ""];
+	return ext === undefined ? name : `${name}${ext}`;
 }
 
 /** Serialize a full request history into the first-turn prompt. */
@@ -332,16 +468,18 @@ const sleep = (ms, signal) => new Promise((resolve, reject) => {
  * Durable replay envelope: keeps the task_id so later turns continue the same
  * task. `blocks` must carry exactly one entry per emitted block — the assembler
  * drops the whole envelope when the lengths disagree, which would silently
- * start a fresh task on the next turn.
+ * start a fresh task on the next turn. `blockTypes` records the emitted block
+ * kinds so the entries mirror the stream (image blocks included).
  */
-function replayState(model, taskId, blockCount) {
+function replayState(model, taskId, blockTypes) {
+	const entries = blockTypes.length > 0 ? blockTypes : ["text"];
 	return {
 		response: {
 			kind: "manus-task",
 			version: 1,
 			model
 		},
-		blocks: Array.from({ length: Math.max(blockCount, 1) }, () => ({ type: "text" })),
+		blocks: entries.map((type) => ({ type })),
 		// Task handle the reader pulls back out (the blocks entries stay opaque).
 		taskId
 	};
@@ -367,13 +505,19 @@ var ManusAdapter = class extends LlmAdapter {
 	 * @param log - diagnostics sink.
 	 * @param credits - optional { record(sessionId, spent) } sink; receives the
 	 *   credit delta measured across one finished turn.
+	 * @param workspaceBridge - optional host-side bridge for generated files:
+	 *   { resolveWorkspace(sessionId) => cwd | undefined,
+	 *     saveImage({ data, mediaType, name }) => ImageAttachmentRef | undefined,
+	 *     fileUrl(sessionId, fileName) => string }. Absent → attachments keep
+	 *   the signed CDN URLs only (the pre-download behaviour).
 	 */
-	constructor(resolveConfig, resolveApiKey, log, credits) {
+	constructor(resolveConfig, resolveApiKey, log, credits, workspaceBridge) {
 		super();
 		this.resolveConfig = resolveConfig;
 		this.resolveApiKey = resolveApiKey;
 		this.log = log;
 		this.credits = credits;
+		this.workspaceBridge = workspaceBridge;
 	}
 
 	providerInfo(provider) {
@@ -511,6 +655,116 @@ var ManusAdapter = class extends LlmAdapter {
 		}
 	}
 
+	/**
+	 * Download the attachments of one assistant message into the session
+	 * workspace and register the display handles for it.
+	 *
+	 * Best-effort by contract: a missing bridge, an unresolvable workspace, a
+	 * failed download or a rejected image never fails the turn — the affected
+	 * attachment simply keeps the signed CDN URL it already had.
+	 *
+	 * @param {object} input
+	 * @param {string} input.sessionId - harness session id (workspace lookup key).
+	 * @param {unknown[]} input.attachments - `assistant_message.attachments`.
+	 * @param {AbortSignal | undefined} input.signal - caller cancellation.
+	 * @param {object} input.config - resolved config snapshot.
+	 * @param {object} input.turn - turn-scoped download state (mutated):
+	 *   `{ dir, dirResolved, savedFiles, displayUrls }`.
+	 * @returns {Promise<object[]>} durable image blocks to emit for this
+	 *   message, in attachment order.
+	 */
+	async persistAttachments({ sessionId, attachments, signal, config, turn }) {
+		const bridge = this.workspaceBridge;
+		if (bridge === undefined || config.downloadAttachments !== true) return [];
+		if (!Array.isArray(attachments) || attachments.length === 0) return [];
+		const dirName = typeof config.downloadDirName === "string" && config.downloadDirName.length > 0
+			? config.downloadDirName
+			: DEFAULT_DOWNLOAD_DIR;
+		// Resolve the workspace once per turn: the lookup goes through host
+		// services and must not run per attachment.
+		if (turn.dir === undefined && turn.dirResolved !== true) {
+			turn.dirResolved = true;
+			try {
+				const cwd = await bridge.resolveWorkspace?.(sessionId);
+				if (typeof cwd === "string" && cwd.length > 0) turn.dir = path.join(cwd, dirName);
+			} catch (error) {
+				this.log(`manus: workspace lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		if (turn.dir === undefined) return [];
+		const imageBlocks = [];
+		for (let index = 0; index < attachments.length; index += 1) {
+			const attachment = attachments[index];
+			if (!isObject(attachment)) continue;
+			const url = typeof attachment.url === "string" && attachment.url.length > 0 ? attachment.url : undefined;
+			if (url === undefined) continue;
+			const envPath = typeof attachment.path === "string" && attachment.path.length > 0 ? attachment.path : undefined;
+			// Same file referenced twice in one turn: already saved + mapped.
+			if (envPath !== undefined && turn.displayUrls.has(envPath)) continue;
+			let data;
+			try {
+				data = await downloadAttachment(url, signal, config.requestTimeoutMs);
+			} catch (error) {
+				if (error instanceof LlmError && error.code === "ABORTED") throw error;
+				this.log(`manus: attachment download failed (${url.split("?")[0]}): ${error instanceof Error ? error.message : String(error)}`);
+				continue;
+			}
+			const contentType = typeof attachment.content_type === "string" ? attachment.content_type : undefined;
+			const baseName = nameForAttachment(attachment, index);
+			let fileName;
+			let filePath;
+			try {
+				await mkdir(turn.dir, { recursive: true });
+				const target = await uniqueWorkspacePath(turn.dir, baseName);
+				await writeFile(target.filePath, data);
+				fileName = target.fileName;
+				filePath = target.filePath;
+			} catch (error) {
+				this.log(`manus: attachment save failed (${baseName}): ${error instanceof Error ? error.message : String(error)}`);
+				continue;
+			}
+			turn.savedFiles.push({ fileName, filePath, contentType });
+			const mediaType = imageMediaType(contentType);
+			if (mediaType !== undefined) {
+				// Durable image block: rendered inline by the GUI and replayable
+				// from the attachment store after the signed URL expires.
+				try {
+					const ref = await bridge.saveImage?.({ data, mediaType, name: fileName });
+					if (ref !== undefined) {
+						imageBlocks.push({ type: "image", attachment: ref });
+						if (envPath !== undefined) {
+							turn.displayUrls.set(envPath, { url: "", filename: fileName, contentType, dropNode: true });
+						}
+						continue;
+					}
+				} catch (error) {
+					this.log(`manus: image block rejected (${fileName}): ${error instanceof Error ? error.message : String(error)}`);
+				}
+			}
+			if (envPath !== undefined) {
+				const fileUrl = bridge.fileUrl?.(sessionId, fileName);
+				if (typeof fileUrl === "string" && fileUrl.length > 0) {
+					turn.displayUrls.set(envPath, { url: fileUrl, filename: fileName, contentType });
+				}
+			}
+		}
+		return imageBlocks;
+	}
+
+	/**
+	 * Footnote listing the files saved into the workspace this turn. Rendered as
+	 * plain text so the paths stay readable (and copy-pasteable) even when the
+	 * GUI cannot open the file route.
+	 */
+	savedFilesFootnote(savedFiles, config) {
+		if (!Array.isArray(savedFiles) || savedFiles.length === 0) return "";
+		const dirName = typeof config.downloadDirName === "string" && config.downloadDirName.length > 0
+			? config.downloadDirName
+			: DEFAULT_DOWNLOAD_DIR;
+		const rows = savedFiles.map((entry) => `- \`${entry.filePath}\``);
+		return `\n\n---\n📎 已保存 ${savedFiles.length} 个文件到工作区（${dirName}）：\n${rows.join("\n")}`;
+	}
+
 	async *generate(options) {
 		const config = this.resolveConfig();
 		const apiKey = await this.resolveApiKey(config.apiKeyEnv);
@@ -581,8 +835,20 @@ var ManusAdapter = class extends LlmAdapter {
 		// the whole reply).
 		let cursor; // start_event_id for the next poll (id of the last event consumed).
 		let turnOpen = false;
+		// Highest allocated block index. Image/file blocks are emitted as
+		// block-end-only chunks BETWEEN text deltas, so the open text block's
+		// index must be tracked separately: appending a later assistant_message
+		// to `blockIndex` would write text deltas into the image block's slot.
 		let blockIndex = -1;
+		let textIndex = -1;
 		let blockText = "";
+		// Block kinds actually emitted this turn, in stream order: the replay
+		// envelope must carry exactly one entry per block or the assembler
+		// drops the task handle and the next turn starts a brand-new task.
+		const emittedBlocks = [];
+		// Generated-file state for this turn: the resolved download directory,
+		// the files written so far, and the per-attachment display overrides.
+		const turn = { dir: undefined, dirResolved: false, savedFiles: [], displayUrls: new Map() };
 		// Every assistant text seen this turn, including `progress` frames that the
 		// visible block skips. If the task stops without ever opening a block (all
 		// output was progress), this is replayed as the answer instead of failing
@@ -627,26 +893,55 @@ var ManusAdapter = class extends LlmAdapter {
 					const payload = isObject(event.assistant_message) ? event.assistant_message : undefined;
 					// Generated files (images, docs, archives…) arrive as env paths
 					// inside `content`; the signed download URLs live in
-					// `attachments[]`. Rewrite before anything is shown or kept.
+					// `attachments[]`. Download them into the workspace first so the
+					// links can point at the durable copies, then rewrite the text.
+					const imageBlocks = await this.persistAttachments({
+						sessionId,
+						attachments: payload?.attachments,
+						signal,
+						config,
+						turn
+					});
 					const text = rewriteAttachments(
 						typeof payload?.content === "string" ? payload.content : "",
-						payload?.attachments
+						payload?.attachments,
+						turn.displayUrls
 					);
-					if (text.length === 0) continue;
-					fallbackText += fallbackText.length === 0 ? text : `\n\n${text}`;
-					if (payload?.delivery_kind === "progress" && !config.showProgress) continue;
-					if (!turnOpen) {
-						blockIndex += 1;
-						blockText = "";
-						yield { type: "block-start", index: blockIndex, blockType: "text" };
-						turnOpen = true;
-					} else {
-						// New event in the same block: newline seam between events.
-						blockText += "\n\n";
-						yield { type: "text-delta", index: blockIndex, text: "\n\n" };
+					if (text.length === 0 && imageBlocks.length === 0) continue;
+					if (text.length > 0) {
+						fallbackText += fallbackText.length === 0 ? text : `\n\n${text}`;
 					}
-					blockText += text;
-					yield { type: "text-delta", index: blockIndex, text };
+					if (payload?.delivery_kind === "progress" && !config.showProgress) {
+						// The picture still displays even when the progress text is
+						// hidden: images belong to the answer, not to the narration.
+						for (const block of imageBlocks) {
+							blockIndex += 1;
+							emittedBlocks.push("image");
+							yield { type: "block-end", index: blockIndex, block };
+						}
+						continue;
+					}
+					if (text.length > 0) {
+						if (!turnOpen) {
+							blockIndex += 1;
+							textIndex = blockIndex;
+							blockText = "";
+							emittedBlocks.push("text");
+							yield { type: "block-start", index: textIndex, blockType: "text" };
+							turnOpen = true;
+						} else {
+							// New event in the same block: newline seam between events.
+							blockText += "\n\n";
+							yield { type: "text-delta", index: textIndex, text: "\n\n" };
+						}
+						blockText += text;
+						yield { type: "text-delta", index: textIndex, text };
+					}
+					for (const block of imageBlocks) {
+						blockIndex += 1;
+						emittedBlocks.push("image");
+						yield { type: "block-end", index: blockIndex, block };
+					}
 				} else if (event.type === "status_update") {
 					const status = isObject(event.status_update) ? event.status_update : undefined;
 					const agentStatus = status?.agent_status;
@@ -663,17 +958,36 @@ var ManusAdapter = class extends LlmAdapter {
 							// visible path skipped. Only a task that produced no text at
 							// all is a genuinely empty turn.
 							if (fallbackText.length === 0) {
-								throw new LlmError(hintFor("EMPTY_RESPONSE"), "EMPTY_RESPONSE");
+								if (turn.savedFiles.length === 0) {
+									throw new LlmError(hintFor("EMPTY_RESPONSE"), "EMPTY_RESPONSE");
+								}
+								// Files arrived without any text: still show the save list.
+								blockIndex += 1;
+								textIndex = blockIndex;
+								blockText = "";
+								emittedBlocks.push("text");
+								yield { type: "block-start", index: textIndex, blockType: "text" };
+								turnOpen = true;
+							} else {
+								blockIndex += 1;
+								textIndex = blockIndex;
+								blockText = fallbackText;
+								emittedBlocks.push("text");
+								yield { type: "block-start", index: textIndex, blockType: "text" };
+								yield { type: "text-delta", index: textIndex, text: fallbackText };
+								turnOpen = true;
 							}
-							blockIndex += 1;
-							blockText = fallbackText;
-							yield { type: "block-start", index: blockIndex, blockType: "text" };
-							yield { type: "text-delta", index: blockIndex, text: fallbackText };
-							turnOpen = true;
+						}
+						// Saved-file footnote: local paths the user (or a later tool
+						// call) can open directly, independent of the GUI renderer.
+						const footnote = this.savedFilesFootnote(turn.savedFiles, config);
+						if (footnote.length > 0 && turnOpen) {
+							blockText += footnote;
+							yield { type: "text-delta", index: textIndex, text: footnote };
 						}
 						yield {
 							type: "block-end",
-							index: blockIndex,
+							index: textIndex,
 							block: { type: "text", text: blockText }
 						};
 						usage.totalTokens = usage.inputTokens + usage.outputTokens;
@@ -690,7 +1004,7 @@ var ManusAdapter = class extends LlmAdapter {
 						yield {
 							type: "finish",
 							reason: { kind: "stop" },
-							replayState: replayState(options.model, taskId, blockIndex + 1)
+							replayState: replayState(options.model, taskId, emittedBlocks)
 						};
 						return;
 					}
@@ -704,13 +1018,18 @@ var ManusAdapter = class extends LlmAdapter {
 						const note = `[manus is waiting for input (${kind})${description ? `: ${description}` : ""} — reply to continue]\n`;
 						if (turnOpen) {
 							blockText += `\n\n${note}`;
-							yield { type: "text-delta", index: blockIndex, text: `\n\n${note}` };
+							yield { type: "text-delta", index: textIndex, text: `\n\n${note}` };
 						} else {
 							blockIndex += 1;
+							textIndex = blockIndex;
 							blockText = note;
-							yield { type: "block-start", index: blockIndex, blockType: "text" };
+							// The replay envelope needs one entry per block; a missing
+							// entry makes the harness drop the task handle and the next
+							// turn starts a brand-new Manus task.
+							emittedBlocks.push("text");
+							yield { type: "block-start", index: textIndex, blockType: "text" };
 							turnOpen = true;
-							yield { type: "text-delta", index: blockIndex, text: note };
+							yield { type: "text-delta", index: textIndex, text: note };
 						}
 					}
 				} else if (event.type === "error_message") {
