@@ -470,8 +470,14 @@ const sleep = (ms, signal) => new Promise((resolve, reject) => {
  * drops the whole envelope when the lengths disagree, which would silently
  * start a fresh task on the next turn. `blockTypes` records the emitted block
  * kinds so the entries mirror the stream (image blocks included).
+ *
+ * `cursor` is the id of the last event consumed this turn. The next turn polls
+ * from it, so a follow-up streams only what the agent just produced instead of
+ * replaying the task's whole transcript (which duplicated old answers and
+ * re-downloaded old attachments on every turn). The assembler only inspects
+ * `blocks`/`response` and passes every other key through untouched.
  */
-function replayState(model, taskId, blockTypes) {
+function replayState(model, taskId, blockTypes, cursor) {
 	const entries = blockTypes.length > 0 ? blockTypes : ["text"];
 	return {
 		response: {
@@ -481,11 +487,12 @@ function replayState(model, taskId, blockTypes) {
 		},
 		blocks: entries.map((type) => ({ type })),
 		// Task handle the reader pulls back out (the blocks entries stay opaque).
-		taskId
+		taskId,
+		...(typeof cursor === "string" && cursor.length > 0 ? { cursor } : {})
 	};
 }
 
-/** Read back a task handle from durable assistant history, or undefined. */
+/** Read back the task handle + event cursor from durable history, or undefined. */
 function readReplay(message) {
 	if (message.source?.kind !== "model" || message.source.replayState === undefined) return undefined;
 	const envelope = message.source.replayState;
@@ -493,7 +500,10 @@ function readReplay(message) {
 	const response = isObject(envelope.response) ? envelope.response : undefined;
 	if (response?.kind !== "manus-task" || response.version !== 1) return undefined;
 	if (typeof envelope.taskId !== "string" || envelope.taskId.length === 0) return undefined;
-	return envelope.taskId;
+	return {
+		taskId: envelope.taskId,
+		cursor: typeof envelope.cursor === "string" && envelope.cursor.length > 0 ? envelope.cursor : undefined
+	};
 }
 
 var ManusAdapter = class extends LlmAdapter {
@@ -782,11 +792,17 @@ var ManusAdapter = class extends LlmAdapter {
 		const base = "https://api.manus.ai/v2";
 
 		// Locate the conversation task: continuing replay history or a fresh task.
+		// The replayed cursor is where the previous turn stopped polling, so this
+		// turn only reads events produced after it.
 		let taskId;
+		let resumeCursor;
 		const lastAssistant = [...options.messages].reverse().find((message) => message.role === "assistant" && message.source?.kind === "model");
 		if (lastAssistant !== undefined) {
 			const replayed = readReplay(lastAssistant);
-			if (replayed !== undefined) taskId = replayed;
+			if (replayed !== undefined) {
+				taskId = replayed.taskId;
+				resumeCursor = replayed.cursor;
+			}
 		}
 
 		const prompt = taskId === undefined ? firstTurnPrompt(options) : followUpPrompt(options);
@@ -833,7 +849,7 @@ var ManusAdapter = class extends LlmAdapter {
 		// block's text is accumulated here because `block-end` REPLACES the
 		// assembled text with the block it carries (an empty payload would erase
 		// the whole reply).
-		let cursor; // start_event_id for the next poll (id of the last event consumed).
+		let cursor = resumeCursor; // start_event_id for the next poll; resumes where the last turn stopped.
 		let turnOpen = false;
 		// Highest allocated block index. Image/file blocks are emitted as
 		// block-end-only chunks BETWEEN text deltas, so the open text block's
@@ -1004,7 +1020,7 @@ var ManusAdapter = class extends LlmAdapter {
 						yield {
 							type: "finish",
 							reason: { kind: "stop" },
-							replayState: replayState(options.model, taskId, emittedBlocks)
+							replayState: replayState(options.model, taskId, emittedBlocks, cursor)
 						};
 						return;
 					}

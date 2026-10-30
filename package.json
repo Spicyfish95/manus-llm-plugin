@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "dsh-manus-llm",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "private": true,
   "type": "module",
   "description": "Manus agent cloud as a DSH model provider (official API v2)",

@@ -5,6 +5,7 @@
 ## 工作方式
 
 - **一轮 = 一个 Manus 任务**：会话首轮调用 `POST /v2/task.create` 创建任务，后续轮次通过 `task.sendMessage` 继续同一任务（任务 id 保存在助手消息的持久 replay state 中，跨重启可续聊）。
+- **续聊只读增量**：轮询用的 `start_event_id` 游标也随 replay state 持久化，因此 follow-up 轮次只读上一轮之后产生的事件，不会把整个任务历史重放一遍（旧答案不会重复出现，旧附件也不会重复下载）。
 - **轮询转流式**：适配器轮询 `GET /v2/task.listMessages`，把新的 `assistant_message` 事件翻译成 Harness 的 `text-delta` 块；`status_update(stopped)` 结束回合。若整轮只有 `progress` 中间消息，则回放这些文本作为答案，而不是丢成空回复。
 - **不支持工具调用**：Manus 有自己的内置工具；适配器声明无工具，工具结果按文本降级传递。
 - **积分读数**：每轮开始/结束各读一次 `GET /v2/usage.availableCredits`，把余额差记为该轮消耗；对话工具栏（模型选择器旁）显示当前余额与「上轮消耗」，点开可看分项（赠送/周期/加购）。

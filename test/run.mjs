@@ -121,6 +121,46 @@ const server = http.createServer((req, res) => {
 				}
 				return;
 			}
+			if (mode === "followup") {
+				// A task that already has history. Polling WITHOUT a cursor returns
+				// the whole transcript (the old answer + its attachment); polling
+				// from the replayed cursor returns only the events this turn
+				// produced. The adapter must resume from the cursor, otherwise every
+				// follow-up repeats the previous answer and re-downloads its files.
+				if (!cursor) {
+					res.end(JSON.stringify({
+						ok: true,
+						task_id: "task_abc123",
+						messages: [
+							{ id: "f1", type: "status_update", timestamp: 1, status_update: { agent_status: "running" } },
+							{
+								id: "f2",
+								type: "assistant_message",
+								timestamp: 2,
+								assistant_message: {
+									content: "Old answer: ![old](/home/ubuntu/old.png)",
+									attachments: [
+										{ type: "file", filename: "old.png", content_type: "image/png", path: "/home/ubuntu/old.png", url: "https://cdn.test/img.png", file_uid: "fo1", version_uid: "fv1" }
+									]
+								}
+							},
+							{ id: "f3", type: "status_update", timestamp: 3, status_update: { agent_status: "stopped" } }
+						],
+						has_more: false
+					}));
+				} else {
+					res.end(JSON.stringify({
+						ok: true,
+						task_id: "task_abc123",
+						messages: [
+							{ id: "f4", type: "assistant_message", timestamp: 4, assistant_message: { content: "New answer only." } },
+							{ id: "f5", type: "status_update", timestamp: 5, status_update: { agent_status: "stopped" } }
+						],
+						has_more: false
+					}));
+				}
+				return;
+			}
 			if (mode === "attachmentsMulti") {
 				// Two assistant messages in one turn: the first carries an image
 				// attachment, the second continues the answer as text. This is the
@@ -531,6 +571,60 @@ const multiChecks = [
 ];
 for (const [pass, label] of multiChecks) {
 	console.log("MULTI:", pass ? "ok" : "FAIL", "-", label);
+	if (!pass) process.exitCode = 1;
+}
+mode = "normal";
+
+// 5g. Follow-up turn resumes from the replayed event cursor: the task's old
+// answer (and its attachment) must NOT be replayed again. Without the cursor
+// the adapter re-reads the whole transcript, duplicating old text and
+// re-downloading old files into -2/-3 copies.
+mode = "followup";
+const followDir = path.join(WORKSPACE_ROOT, "manus-files");
+await rm(followDir, { recursive: true, force: true });
+const turnFollow = await runTurn({
+	provider: "manus",
+	model: "standard",
+	sessionId: "session-workspace",
+	messages: [
+		userMessage("Draw it."),
+		{
+			role: "assistant",
+			content: [{ type: "text", text: "Old answer" }],
+			source: {
+				kind: "model",
+				provider: "manus",
+				model: "standard",
+				replayState: {
+					response: { kind: "manus-task", version: 1, model: "standard" },
+					blocks: [{ type: "text" }],
+					taskId: "task_abc123",
+					cursor: "f3"
+				}
+			}
+		},
+		userMessage("Now the follow-up.")
+	],
+	signal: undefined
+}, workspaceAdapter);
+const followText = textOf(turnFollow);
+const followReplay = turnFollow.at(-1)?.replayState;
+let followFiles = [];
+try {
+	followFiles = await readdir(followDir);
+} catch {
+	followFiles = [];
+}
+const followChecks = [
+	[!followText.includes("Old answer"), "old transcript not replayed"],
+	[followText.includes("New answer only."), "only the new answer streams"],
+	[followFiles.length === 0, `no stale attachment re-downloaded (got ${JSON.stringify(followFiles)})`],
+	[followReplay?.taskId === "task_abc123", "task handle preserved"],
+	[followReplay?.cursor === "f5", `cursor advanced to the last event (got ${JSON.stringify(followReplay?.cursor)})`],
+	[followReplay?.blocks?.length === 1 && followReplay.blocks[0].type === "text", "replay blocks stay aligned"]
+];
+for (const [pass, label] of followChecks) {
+	console.log("FOLLOWUP:", pass ? "ok" : "FAIL", "-", label);
 	if (!pass) process.exitCode = 1;
 }
 mode = "normal";
