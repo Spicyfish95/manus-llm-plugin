@@ -20,6 +20,7 @@ const CDN_BODIES = new Map([
 let mode = "normal";
 let creditShape = "flat";
 let createBody = null;
+let sendBody = null;
 let creditCalls = 0;
 let totalCredits = 1000;
 
@@ -46,6 +47,7 @@ const server = http.createServer((req, res) => {
 			createBody = JSON.parse(body);
 			res.end(JSON.stringify({ ok: true, request_id: "r1", task_id: "task_abc123", task_title: "t", task_url: "u" }));
 		} else if (req.method === "POST" && url.pathname === "/v2/task.sendMessage") {
+			sendBody = JSON.parse(body);
 			res.end(JSON.stringify({ ok: true, request_id: "r2", task_id: "task_abc123" }));
 		} else if (req.method === "POST" && url.pathname === "/v2/task.stop") {
 			res.end(JSON.stringify({ ok: true, request_id: "r3", task_id: "task_abc123" }));
@@ -391,6 +393,20 @@ const turn1 = await runTurn({
 	signal: undefined
 });
 console.log("TURN1 agent_profile (expect max-ultra):", createBody?.agent_profile);
+// Only the latest user text is forwarded: no harness system prompt, no
+// history replay, no <environment> wrapper. This is the regression for
+// 「Manus 网页端首条消息显示 You are an AI agent powered by DeepSeek Harness…」.
+const turn1Prompt = createBody?.message?.content ?? "";
+const turn1PromptChecks = [
+	[turn1Prompt === "Introduce yourself in one line.", `first-turn prompt is exactly the user text (got ${JSON.stringify(turn1Prompt)})`],
+	[!turn1Prompt.includes("DeepSeek Harness"), "no harness system prompt leak"],
+	[!turn1Prompt.includes("<environment>"), "no <environment> wrapper"],
+	[!turn1Prompt.includes("helpful assistant"), "system message not forwarded"]
+];
+for (const [pass, label] of turn1PromptChecks) {
+	console.log("TURN1 PROMPT:", pass ? "ok" : "FAIL", "-", label);
+	if (!pass) process.exitCode = 1;
+}
 console.log("TURN1 TEXT:", JSON.stringify(textOf(turn1)));
 console.log("TURN1 BLOCK events:", turn1.filter((c) => c.type === "block-start" || c.type === "block-end").map((c) => `${c.type}@${c.index}`).join(","));
 const blockEnd = turn1.find((c) => c.type === "block-end");
@@ -433,6 +449,61 @@ const turn2 = await runTurn({
 });
 console.log("TURN2 createCalls (expect 0):", createCalls);
 console.log("TURN2 TEXT:", JSON.stringify(textOf(turn2)));
+// Follow-up: the sendMessage body must also carry ONLY the latest user text —
+// not the replayed assistant history and not any tool/system framing.
+const turn2Prompt = sendBody?.message?.content ?? "";
+const turn2PromptChecks = [
+	[turn2Prompt === "What did I just ask?", `follow-up prompt is exactly the latest user text (got ${JSON.stringify(turn2Prompt)})`],
+	[!turn2Prompt.includes("Hello from"), "previous assistant reply not forwarded"]
+];
+for (const [pass, label] of turn2PromptChecks) {
+	console.log("TURN2 PROMPT:", pass ? "ok" : "FAIL", "-", label);
+	if (!pass) process.exitCode = 1;
+}
+
+// 3b. Tool-loop degradation: a tool result after the latest user turn is
+// appended as readable text (Manus has its own tools; the harness loop
+// degrades them), and nothing BEFORE the latest user turn is forwarded.
+const turn2b = await runTurn({
+	provider: "manus",
+	model: "max",
+	messages: [
+		{ role: "system", content: [{ type: "text", text: "SYSTEM-NEVER-FORWARDED" }] },
+		userMessage("Earlier user turn ABCXYZ."),
+		{ role: "assistant", content: [{ type: "text", text: "ack reply stale for forwarding" }] },
+		userMessage("Read the file."),
+		{
+			role: "assistant",
+			content: [],
+			toolCalls: [{ id: "call_1", name: "read", arguments: {} }],
+			source: {
+				kind: "model",
+				provider: "manus",
+				model: "max",
+				replayState: {
+					response: { kind: "manus-task", version: 1, model: "max" },
+					blocks: [{ type: "text" }],
+					taskId: "task_abc123"
+				}
+			}
+		},
+		{ role: "tool", toolCallId: "call_1", content: [{ type: "text", text: "file contents here" }] }
+	],
+	signal: undefined
+});
+const turn2bPrompt = sendBody?.message?.content ?? "";
+const turn2bChecks = [
+	[turn2bPrompt.startsWith("Read the file."), `prompt starts with the user text (got ${JSON.stringify(turn2bPrompt)})`],
+	[turn2bPrompt.includes('Result of tool call "call_1":'), "trailing tool result appended"],
+	[turn2bPrompt.includes("file contents here"), "tool result text carried"],
+	[!turn2bPrompt.includes("ABCXYZ"), "earlier user turns not forwarded"],
+	[!turn2bPrompt.includes("stale for forwarding"), "earlier assistant replies not forwarded"],
+	[!turn2bPrompt.includes("SYSTEM-NEVER-FORWARDED"), "system message never forwarded"]
+];
+for (const [pass, label] of turn2bChecks) {
+	console.log("TURN2B TOOL DEGRADE:", pass ? "ok" : "FAIL", "-", label);
+	if (!pass) process.exitCode = 1;
+}
 
 // 4. Progress-only task: the skipped progress text is replayed, not EMPTY_RESPONSE.
 mode = "progressOnly";

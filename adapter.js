@@ -16,6 +16,11 @@
  *   translation on the wire.
  *   A turn is one API task; a session maps to the same task across turns via the
  *   generated task_id written into the assistant replay state (durable, log-derived).
+ * - Only the user's latest submitted text is forwarded to Manus. The harness
+ *   system prompt and conversation history stay local: a Manus task keeps its
+ *   own cross-turn context (one task per session), and forwarding the harness
+ *   boilerplate made every new task open with a 10+KB "You are an AI agent…"
+ *   blob that the Manus web UI renders as a giant attachment card.
  * - Polling drives the stream: after creating/sending a message, we poll
  *   task.listMessages (order=asc, start_event_id=cursor) and translate each
  *   new assistant_message into text-delta chunks with small synthetic delays so
@@ -420,34 +425,31 @@ function nameForAttachment(attachment, index) {
 	return ext === undefined ? name : `${name}${ext}`;
 }
 
-/** Serialize a full request history into the first-turn prompt. */
-function firstTurnPrompt(options) {
-	const parts = [];
-	const system = options.system;
-	if (system && system.length > 0) {
-		parts.push(`<environment>\n${system}\n</environment>`);
+/**
+ * Extract the text of the LATEST user turn — the only thing forwarded to
+ * Manus. The harness system prompt and the rest of the conversation history
+ * never leave the machine (see the design note in the file header). Trailing
+ * tool results (tool-loop degradation) are appended after the user text.
+ */
+function latestTurnPrompt(options) {
+	const messages = Array.isArray(options.messages) ? options.messages : [];
+	let lastUserIndex = -1;
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		if (messages[index]?.role === "user") {
+			lastUserIndex = index;
+			break;
+		}
 	}
-	for (const message of options.messages) {
-		if (message.role === "assistant") {
-			// Manually replayed assistant history: fold as context.
-			const text = blocksToText(message.content);
-			if (text.length > 0) parts.push(`Previous assistant reply:\n${text}`);
-			continue;
-		}
-		if (message.role === "tool") {
-			const label = `Result of tool call "${message.toolCallId}"`;
-			parts.push(`${label}:\n${blocksToText(message.content)}`);
-			continue;
-		}
-		const text = blocksToText(message.content);
-		if (text.length > 0) parts.push(text);
+	if (lastUserIndex === -1) return "";
+	const parts = [];
+	const userText = blocksToText(messages[lastUserIndex].content);
+	if (userText.length > 0) parts.push(userText);
+	for (let index = lastUserIndex + 1; index < messages.length; index += 1) {
+		const message = messages[index];
+		if (message?.role !== "tool") continue;
+		parts.push(`Result of tool call "${message.toolCallId}":\n${blocksToText(message.content)}`);
 	}
 	return parts.join("\n\n");
-}
-
-/** Follow-up prompt: user text plus any tool results (tool loop degradation). */
-function followUpPrompt(options) {
-	return firstTurnPrompt(options);
 }
 
 const sleep = (ms, signal) => new Promise((resolve, reject) => {
@@ -805,7 +807,7 @@ var ManusAdapter = class extends LlmAdapter {
 			}
 		}
 
-		const prompt = taskId === undefined ? firstTurnPrompt(options) : followUpPrompt(options);
+		const prompt = latestTurnPrompt(options);
 		if (prompt.length === 0) {
 			throw new LlmError(hintFor("INVALID_REQUEST", "输入内容为空"), "INVALID_REQUEST");
 		}
