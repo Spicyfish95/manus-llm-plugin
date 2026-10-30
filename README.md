@@ -15,7 +15,7 @@
 |---|---|---|
 | `manus/standard` | `standard` | 标准代理档，速度与能力均衡 |
 | `manus/lite` | `lite` | 轻量快速档，积分消耗更低 |
-| `manus/max` | `max`（默认）/ `max-medium` / `max-high` / `max-extra` / `max-ultra` | 深度推理档；思考等级在模型选择器里选 |
+| `manus/max` | `default`（默认）/ `max-medium` / `max-high` / `max-extra` / `max-ultra` | 深度推理档；思考等级在模型选择器里选 |
 
 只有 `max` 档带推理强度元数据，因此在模型选择器里选中 `Manus Max` 后会额外出现思考等级选项（默认 / 中 / 高 / 增强 / 极致）。所选等级的 id **就是** Manus 的 `agent_profile` 值，不需要再做映射；其余两档只有一个行为，不显示强度选项。
 
