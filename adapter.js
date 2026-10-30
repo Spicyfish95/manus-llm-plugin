@@ -426,7 +426,26 @@ function nameForAttachment(attachment, index) {
 }
 
 /**
- * Extract the text of the LATEST user turn — the only thing forwarded to
+ * Synthetic user-role messages injected by harness internals carry a `source`
+ * attribution that real user input never has. Forwarding them to Manus made
+ * "显示当前时间" arrive as a time-sample snapshot instead of the user's words.
+ * Kinds verified in the host runtime (app.asar):
+ * - "runtime-context"  — per-step dynamic context snapshot (asar L316280)
+ * - "time-context"     — @deepseek-ai/dsh-time-context clock readings
+ * - "compact-checkpoint" — post-compaction summary checkpoint (asar L450761)
+ * Real user input is source.kind "user" (the time-context plugin reads
+ * clientTimeZone off exactly that shape). Defensive: unknown/absent source
+ * kinds with user role are also treated as real user input.
+ */
+const SYNTHETIC_USER_SOURCE_KINDS = new Set(["runtime-context", "time-context", "compact-checkpoint"]);
+
+function isSyntheticUserMessage(message) {
+	const source = message?.source;
+	return typeof source === "object" && source !== null && typeof source.kind === "string" && SYNTHETIC_USER_SOURCE_KINDS.has(source.kind);
+}
+
+/**
+ * Extract the text of the LATEST real user turn — the only thing forwarded to
  * Manus. The harness system prompt and the rest of the conversation history
  * never leave the machine (see the design note in the file header). Trailing
  * tool results (tool-loop degradation) are appended after the user text.
@@ -435,7 +454,8 @@ function latestTurnPrompt(options) {
 	const messages = Array.isArray(options.messages) ? options.messages : [];
 	let lastUserIndex = -1;
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		if (messages[index]?.role === "user") {
+		const message = messages[index];
+		if (message?.role === "user" && !isSyntheticUserMessage(message)) {
 			lastUserIndex = index;
 			break;
 		}

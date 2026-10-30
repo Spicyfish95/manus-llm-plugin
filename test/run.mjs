@@ -505,6 +505,77 @@ for (const [pass, label] of turn2bChecks) {
 	if (!pass) process.exitCode = 1;
 }
 
+// 3c. Harness-injected user-role messages must never be forwarded: the
+// latest "user" message can be a time-context clock reading, a runtime-context
+// snapshot, or a compaction checkpoint. The scan must skip them and forward
+// the latest REAL user text instead (user bug: 显示当前时间 arrived on Manus
+// as the literal clock text).
+sendBody = null;
+createBody = null;
+const turn2c = await runTurn({
+	provider: "manus",
+	model: "max",
+	messages: [
+		{
+			role: "user",
+			content: [{ type: "text", text: "显示当前时间" }]
+		},
+		{
+			role: "user",
+			source: {
+				kind: "time-context",
+				form: "snapshot",
+				sections: [{ name: "time-context", text: "x" }]
+			},
+			content: [{ type: "text", text: "Time sampled while preparing turn 6, step 2: 2026-10-30T15:33:26+08:00[Asia/Hong_Kong]" }]
+		},
+		{
+			role: "user",
+			source: { kind: "runtime-context" },
+			content: [{ type: "text", text: "Current runtime context. This snapshot supersedes earlier runtime-context snapshots." }]
+		},
+		{
+			role: "user",
+			source: { kind: "compact-checkpoint", compactionId: "c1" },
+			content: [{ type: "text", text: "[Compressed conversation section] — checkpoint" }]
+		}
+	],
+	signal: undefined
+});
+const turn2cPrompt = sendBody?.message?.content ?? createBody?.message?.content ?? "";
+const turn2cChecks = [
+	[turn2cPrompt === "显示当前时间", `synthetic user messages skipped, real user text forwarded (got ${JSON.stringify(turn2cPrompt)})`],
+	[!turn2cPrompt.includes("Time sampled"), "time-context clock reading never forwarded"],
+	[!turn2cPrompt.includes("runtime-context snapshots"), "runtime-context snapshot never forwarded"],
+	[!turn2cPrompt.includes("Compressed conversation section"), "compaction checkpoint never forwarded"]
+];
+for (const [pass, label] of turn2cChecks) {
+	console.log("TURN2C SYNTHETIC:", pass ? "ok" : "FAIL", "-", label);
+	if (!pass) process.exitCode = 1;
+}
+
+// 3d. Defensive default: a user message with NO source (or an unknown source
+// kind) is treated as real user input and forwarded.
+sendBody = null;
+createBody = null;
+const turn2d = await runTurn({
+	provider: "manus",
+	model: "max",
+	messages: [
+		{ role: "user", source: { kind: "some-future-kind" }, content: [{ type: "text", text: "future injected kind" }] },
+		userMessage("plain user text without source")
+	],
+	signal: undefined
+});
+const turn2dPrompt = sendBody?.message?.content ?? createBody?.message?.content ?? "";
+const turn2dChecks = [
+	[turn2dPrompt === "plain user text without source", `unknown/absent source kinds treated as real user (got ${JSON.stringify(turn2dPrompt)})`]
+];
+for (const [pass, label] of turn2dChecks) {
+	console.log("TURN2D DEFENSIVE:", pass ? "ok" : "FAIL", "-", label);
+	if (!pass) process.exitCode = 1;
+}
+
 // 4. Progress-only task: the skipped progress text is replayed, not EMPTY_RESPONSE.
 mode = "progressOnly";
 createBody = null;
