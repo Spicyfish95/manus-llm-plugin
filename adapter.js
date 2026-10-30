@@ -206,6 +206,84 @@ function blocksToText(blocks) {
 		.join("\n");
 }
 
+/**
+ * Rewrite Manus execution-environment references inside an assistant message
+ * into downloadable links. Per the official Attachments guide, the API returns
+ * `content` with raw env paths (`![img](/home/ubuntu/x.png)`) while the actual
+ * signed download URLs live in `attachments[]`. Without this step every
+ * generated image / file / archive renders as a dead link in the chat.
+ *
+ * Rules (mirroring the guide):
+ *  - http(s) destinations pass through untouched;
+ *  - a Markdown link/image whose destination matches an attachment `path`
+ *    (after one URL-decode) is rewritten to the attachment `url`;
+ *  - unmatched local-path nodes are dropped (the guide says to remove what
+ *    cannot be resolved) while the surrounding text is preserved.
+ * Attachments without a usable `path` (e.g. website checkpoints are handled
+ * separately by the agent text itself) are ignored here.
+ */
+function rewriteAttachments(content, attachments) {
+	if (typeof content !== "string" || content.length === 0) return content;
+	if (!Array.isArray(attachments) || attachments.length === 0) return content;
+	const byPath = new Map();
+	for (const attachment of attachments) {
+		if (!isObject(attachment)) continue;
+		const path = typeof attachment.path === "string" ? attachment.path : undefined;
+		const url = typeof attachment.url === "string" ? attachment.url : undefined;
+		if (path === undefined || url === undefined || path.length === 0 || url.length === 0) continue;
+		byPath.set(path, { url, filename: typeof attachment.filename === "string" ? attachment.filename : undefined, contentType: typeof attachment.content_type === "string" ? attachment.content_type : undefined });
+	}
+	if (byPath.size === 0) return content;
+	let decodedCache;
+	const resolveDest = (rawDest) => {
+		if (/^https?:\/\//i.test(rawDest)) return undefined; // public URL: render as-is
+		if (rawDest.startsWith("manus-webdev://")) return null; // website checkpoint: not resolvable here → drop node
+		if (/^[a-z][a-z0-9+.-]*:/i.test(rawDest)) return null; // other scheme: drop node per guide
+		try {
+			decodedCache ??= new Map();
+			let decoded = decodedCache.get(rawDest);
+			if (decoded === undefined) {
+				decoded = decodeURI(rawDest);
+				decodedCache.set(rawDest, decoded);
+			}
+			const match = byPath.get(decoded) ?? byPath.get(rawDest);
+			return match === undefined ? null : match; // null = unresolvable → drop node
+		} catch {
+			const match = byPath.get(rawDest);
+			return match === undefined ? null : match;
+		}
+	};
+	const trimTitle = (dest) => dest.replace(/\s+"[^"]*"$/, "").replace(/\s+$/, "");
+	// Images: ![alt](dest) → keep as image when resolvable (signed CDN URL).
+	// Dest may contain spaces (e.g. `/home/ubuntu/out/image 1.png`), so the
+	// capture is bounded by the closing paren, then a trailing "title" is cut.
+	let rewritten = content.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (whole, alt, dest) => {
+		const match = resolveDest(trimTitle(dest));
+		if (match === undefined) return whole;
+		if (match === null) return "";
+		return `![${alt}](${match.url})`;
+	});
+	// Links: [text](dest) → rendered as a download link. For non-image files
+	// (docs/archives/spreadsheets) the link text is replaced with the filename
+	// so long env paths never leak into the chat bubble.
+	rewritten = rewritten.replace(/\[([^\]]*)\]\(([^)]+)\)/g, (whole, text, dest) => {
+		const match = resolveDest(trimTitle(dest));
+		if (match === undefined) return whole;
+		if (match === null) return "";
+		const isImageLink = match.contentType !== undefined && match.contentType.startsWith("image/");
+		const label = isImageLink || match.filename === undefined ? text : match.filename;
+		return `[${label}](${match.url})`;
+	});
+	// Bare absolute env paths that were not Markdown-wrapped (e.g. the agent
+	// writes `/home/ubuntu/result.zip` inline): link them when an attachment
+	// matches, otherwise leave the text alone (it is plain prose there).
+	rewritten = rewritten.replace(/(?<!\]\()((?:\/[\w.-]+){2,})(?!\))/g, (whole, envPath) => {
+		const match = byPath.get(envPath);
+		return match === undefined ? whole : `[${match.filename ?? envPath.split("/").pop()}](${match.url})`;
+	});
+	return rewritten;
+}
+
 /** Serialize a full request history into the first-turn prompt. */
 function firstTurnPrompt(options) {
 	const parts = [];
@@ -547,7 +625,13 @@ var ManusAdapter = class extends LlmAdapter {
 				cursor = event.id;
 				if (event.type === "assistant_message") {
 					const payload = isObject(event.assistant_message) ? event.assistant_message : undefined;
-					const text = typeof payload?.content === "string" ? payload.content : "";
+					// Generated files (images, docs, archives…) arrive as env paths
+					// inside `content`; the signed download URLs live in
+					// `attachments[]`. Rewrite before anything is shown or kept.
+					const text = rewriteAttachments(
+						typeof payload?.content === "string" ? payload.content : "",
+						payload?.attachments
+					);
 					if (text.length === 0) continue;
 					fallbackText += fallbackText.length === 0 ? text : `\n\n${text}`;
 					if (payload?.delivery_kind === "progress" && !config.showProgress) continue;

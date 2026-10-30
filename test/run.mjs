@@ -67,6 +67,41 @@ const server = http.createServer((req, res) => {
 				}
 				return;
 			}
+			if (mode === "attachments") {
+				if (!cursor) {
+					res.end(JSON.stringify({
+						ok: true,
+						task_id: "task_abc123",
+						messages: [
+							{
+								id: "a1",
+								type: "assistant_message",
+								timestamp: 2,
+								assistant_message: {
+									content: [
+										"Image: ![pic](/home/ubuntu/out/image 1.png)",
+										"Doc: [Download the report](/home/ubuntu/report.pdf)",
+										"Zip: /home/ubuntu/bundle.zip",
+										"Keep: [site](https://example.com) and ![remote](https://cdn.example.com/a.png)",
+										"Drop: [ghost](/home/ubuntu/missing.bin)",
+										"Scheme: [proto](manus-files://x)"
+									].join("\n"),
+									attachments: [
+										{ type: "file", filename: "image 1.png", content_type: "image/png", path: "/home/ubuntu/out/image 1.png", url: "https://cdn.test/img.png", file_uid: "fu1", version_uid: "vu1" },
+										{ type: "file", filename: "report.pdf", content_type: "application/pdf", path: "/home/ubuntu/report.pdf", url: "https://cdn.test/report.pdf", file_uid: "fu2", version_uid: "vu2" },
+										{ type: "file", filename: "bundle.zip", content_type: "application/zip", path: "/home/ubuntu/bundle.zip", url: "https://cdn.test/bundle.zip", file_uid: "fu3", version_uid: "vu3" }
+									]
+								}
+							},
+							{ id: "a2", type: "status_update", timestamp: 3, status_update: { agent_status: "stopped" } }
+						],
+						has_more: false
+					}));
+				} else {
+					res.end(JSON.stringify({ ok: true, task_id: "task_abc123", messages: [], has_more: false }));
+				}
+				return;
+			}
 			if (!cursor) {
 				// Page 1 ends mid-turn: `has_more` means page 2 starts at e3.
 				res.end(JSON.stringify({
@@ -254,7 +289,35 @@ console.log("TURN3 TEXT (expect progress replay):", JSON.stringify(textOf(turn3)
 console.log("TURN3 CREDITS recorded:", JSON.stringify(recorded));
 mode = "normal";
 
-// 5. Probe path: a FLAT credits body must read as a healthy connection.
+// 5. Attachment rewriting: env paths in content must resolve to signed URLs.
+mode = "attachments";
+creditCalls = 0;
+totalCredits = 1000;
+const turn4 = await runTurn({
+	provider: "manus",
+	model: "standard",
+	sessionId: "session-attach",
+	messages: [userMessage("Draw a picture and pack the files.")],
+	signal: undefined
+});
+const attachText = textOf(turn4);
+console.log("ATTACH TEXT:", JSON.stringify(attachText));
+const attachChecks = [
+	[attachText.includes("![pic](https://cdn.test/img.png)"), "image env path → signed URL"],
+	[attachText.includes("[report.pdf](https://cdn.test/report.pdf)"), "doc link → filename + signed URL"],
+	[attachText.includes("[bundle.zip](https://cdn.test/bundle.zip)"), "bare zip path → download link"],
+	[attachText.includes("[site](https://example.com)") && attachText.includes("![remote](https://cdn.example.com/a.png)"), "http(s) destinations untouched"],
+	[!attachText.includes("/home/ubuntu/missing.bin") && !attachText.includes("[ghost]"), "unresolvable node dropped"],
+	[!attachText.includes("manus-files://"), "unknown scheme node dropped"],
+	[!attachText.includes("image%201.png"), "URL-decoded path matched (space filename)"]
+];
+for (const [pass, label] of attachChecks) {
+	console.log("ATTACH:", pass ? "ok" : "FAIL", "-", label);
+	if (!pass) process.exitCode = 1;
+}
+mode = "normal";
+
+// 6. Probe path: a FLAT credits body must read as a healthy connection.
 // This is the regression for 「检测连接：Manus 返回了无法识别的余额数据」 —
 // the old parser only looked under `data` and rejected the live shape.
 creditCalls = 0;
