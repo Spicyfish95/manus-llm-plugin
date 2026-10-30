@@ -506,10 +506,11 @@ for (const [pass, label] of turn2bChecks) {
 }
 
 // 3c. Harness-injected user-role messages must never be forwarded: the
-// latest "user" message can be a time-context clock reading, a runtime-context
-// snapshot, or a compaction checkpoint. The scan must skip them and forward
-// the latest REAL user text instead (user bug: 显示当前时间 arrived on Manus
-// as the literal clock text).
+// latest "user" message can be a skills-catalog reminder, a workspace-
+// instructions reminder, a time-context clock reading, a runtime-context
+// snapshot, or a compaction checkpoint. The scan forwards only REAL user
+// input (source kind "user"), so it skips all of them and forwards the last
+// genuine turn (user bug: hello arrived on Manus as the skills catalog).
 sendBody = null;
 createBody = null;
 const turn2c = await runTurn({
@@ -518,7 +519,25 @@ const turn2c = await runTurn({
 	messages: [
 		{
 			role: "user",
-			content: [{ type: "text", text: "显示当前时间" }]
+			content: [{ type: "text", text: "hello" }]
+		},
+		{
+			role: "user",
+			source: {
+				kind: "skill-catalog",
+				form: "catalog",
+				entries: []
+			},
+			content: [{ type: "text", text: "<system-reminder>\nA skill is a reusable set of task-specific instructions.\n</system-reminder>" }]
+		},
+		{
+			role: "user",
+			source: {
+				kind: "agent-instructions",
+				form: "instructions",
+				changes: []
+			},
+			content: [{ type: "text", text: "<system-reminder>\nWorkspace instructions baseline.\n</system-reminder>" }]
 		},
 		{
 			role: "user",
@@ -544,7 +563,9 @@ const turn2c = await runTurn({
 });
 const turn2cPrompt = sendBody?.message?.content ?? createBody?.message?.content ?? "";
 const turn2cChecks = [
-	[turn2cPrompt === "显示当前时间", `synthetic user messages skipped, real user text forwarded (got ${JSON.stringify(turn2cPrompt)})`],
+	[turn2cPrompt === "hello", `all synthetic user messages skipped, real user text forwarded (got ${JSON.stringify(turn2cPrompt)})`],
+	[!turn2cPrompt.includes("skill is a reusable"), "skills-catalog reminder never forwarded"],
+	[!turn2cPrompt.includes("Workspace instructions"), "agent-instructions reminder never forwarded"],
 	[!turn2cPrompt.includes("Time sampled"), "time-context clock reading never forwarded"],
 	[!turn2cPrompt.includes("runtime-context snapshots"), "runtime-context snapshot never forwarded"],
 	[!turn2cPrompt.includes("Compressed conversation section"), "compaction checkpoint never forwarded"]
@@ -554,14 +575,18 @@ for (const [pass, label] of turn2cChecks) {
 	if (!pass) process.exitCode = 1;
 }
 
-// 3d. Defensive default: a user message with NO source (or an unknown source
-// kind) is treated as real user input and forwarded.
+// 3d. Whitelist semantics: user messages with source kind "user" or
+// "user-question-reply" are forwarded; an UNKNOWN source kind is a harness
+// injection (future kinds) and is skipped; no source at all is defensive-
+// treated as real user input.
 sendBody = null;
 createBody = null;
 const turn2d = await runTurn({
 	provider: "manus",
 	model: "max",
 	messages: [
+		{ role: "user", source: { kind: "user", rpcId: "rpc_1" }, content: [{ type: "text", text: "real rpc user text" }] },
+		{ role: "user", source: { kind: "user-question-reply", callId: "call_q1", outcome: "answered" }, content: [{ type: "text", text: "question answer text" }] },
 		{ role: "user", source: { kind: "some-future-kind" }, content: [{ type: "text", text: "future injected kind" }] },
 		userMessage("plain user text without source")
 	],
@@ -569,10 +594,46 @@ const turn2d = await runTurn({
 });
 const turn2dPrompt = sendBody?.message?.content ?? createBody?.message?.content ?? "";
 const turn2dChecks = [
-	[turn2dPrompt === "plain user text without source", `unknown/absent source kinds treated as real user (got ${JSON.stringify(turn2dPrompt)})`]
+	[turn2dPrompt === "plain user text without source", `unknown future kind skipped, no-source treated as real user (got ${JSON.stringify(turn2dPrompt)})`],
+	[!turn2dPrompt.includes("future injected kind"), "unknown source kind never forwarded"]
 ];
 for (const [pass, label] of turn2dChecks) {
-	console.log("TURN2D DEFENSIVE:", pass ? "ok" : "FAIL", "-", label);
+	console.log("TURN2D WHITELIST:", pass ? "ok" : "FAIL", "-", label);
+	if (!pass) process.exitCode = 1;
+}
+
+// 3e. Real user shapes are forwarded verbatim: the latest forwardable message
+// wins, whether it is a plain "user" kind (ACP/GUI) or a question reply.
+sendBody = null;
+createBody = null;
+const turn2e = await runTurn({
+	provider: "manus",
+	model: "max",
+	messages: [
+		userMessage("older real turn"),
+		{ role: "user", source: { kind: "user", rpcId: "rpc_2", clientTimeZone: "Asia/Hong_Kong" }, content: [{ type: "text", text: "latest rpc turn" }] }
+	],
+	signal: undefined
+});
+const turn2ePrompt = sendBody?.message?.content ?? createBody?.message?.content ?? "";
+sendBody = null;
+createBody = null;
+const turn2f = await runTurn({
+	provider: "manus",
+	model: "max",
+	messages: [
+		{ role: "user", source: { kind: "user", rpcId: "rpc_3" }, content: [{ type: "text", text: "question turn" }] },
+		{ role: "user", source: { kind: "user-question-reply", callId: "call_q2", outcome: "answered" }, content: [{ type: "text", text: "the typed answer" }] }
+	],
+	signal: undefined
+});
+const turn2fPrompt = sendBody?.message?.content ?? createBody?.message?.content ?? "";
+const turn2eChecks = [
+	[turn2ePrompt === "latest rpc turn", `user-rpc kind forwarded (got ${JSON.stringify(turn2ePrompt)})`],
+	[turn2fPrompt === "the typed answer", `user-question-reply forwarded as latest turn (got ${JSON.stringify(turn2fPrompt)})`]
+];
+for (const [pass, label] of turn2eChecks) {
+	console.log("TURN2E/F REAL USER:", pass ? "ok" : "FAIL", "-", label);
 	if (!pass) process.exitCode = 1;
 }
 

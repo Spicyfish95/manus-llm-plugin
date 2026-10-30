@@ -5,7 +5,7 @@
 ## 工作方式
 
 - **一轮 = 一个 Manus 任务**：会话首轮调用 `POST /v2/task.create` 创建任务，后续轮次通过 `task.sendMessage` 继续同一任务（任务 id 保存在助手消息的持久 replay state 中，跨重启可续聊）。
-- **只转发你提交的文字**：发送给 Manus API 的内容只有你最新一条消息的文字（外加紧随其后的工具结果降级文本）。Harness 的 system 提示词、会话历史、环境信息、时间快照（"Time sampled…"）、运行时上下文快照（"Current runtime context…"）与压缩检查点一律不上传——Manus 网页端看到的任务首条消息就是你那句话本身，而不是一大段 "You are an AI agent…" 附件。跨轮上下文由同一个 Manus 任务自身维持。
+- **只转发你提交的文字**：发送给 Manus API 的内容只有你最新一条消息的文字（外加紧随其后的工具结果降级文本）。适配器按白名单识别真人输入——仅 `source.kind` 为 `user`（含 user-rpc）或 `user-question-reply`（提问回答）的用户消息会被转发，无 source 的裸消息按真人兜底放行。Harness 的 system 提示词、会话历史、环境信息、技能目录提醒（`<system-reminder>…available_skills…`）、工作区指令提醒（AGENTS.md 基线）、时间快照（"Time sampled…"）、运行时上下文快照（"Current runtime context…"）与压缩检查点一律不上传，未来新增的注入类型同样默认拦截——Manus 网页端看到的任务首条消息就是你那句话本身，而不是一大段 "You are an AI agent…" 附件。跨轮上下文由同一个 Manus 任务自身维持。
 - **续聊只读增量**：轮询用的 `start_event_id` 游标也随 replay state 持久化，因此 follow-up 轮次只读上一轮之后产生的事件，不会把整个任务历史重放一遍（旧答案不会重复出现，旧附件也不会重复下载）。
 - **轮询转流式**：适配器轮询 `GET /v2/task.listMessages`，把新的 `assistant_message` 事件翻译成 Harness 的 `text-delta` 块；`status_update(stopped)` 结束回合。若整轮只有 `progress` 中间消息，则回放这些文本作为答案，而不是丢成空回复。
 - **不支持工具调用**：Manus 有自己的内置工具；适配器声明无工具，工具结果按文本降级传递。

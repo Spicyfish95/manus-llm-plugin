@@ -426,22 +426,28 @@ function nameForAttachment(attachment, index) {
 }
 
 /**
- * Synthetic user-role messages injected by harness internals carry a `source`
- * attribution that real user input never has. Forwarding them to Manus made
- * "显示当前时间" arrive as a time-sample snapshot instead of the user's words.
- * Kinds verified in the host runtime (app.asar):
- * - "runtime-context"  — per-step dynamic context snapshot (asar L316280)
- * - "time-context"     — @deepseek-ai/dsh-time-context clock readings
- * - "compact-checkpoint" — post-compaction summary checkpoint (asar L450761)
- * Real user input is source.kind "user" (the time-context plugin reads
- * clientTimeZone off exactly that shape). Defensive: unknown/absent source
- * kinds with user role are also treated as real user input.
+ * Only REAL user input is forwarded to Manus. Harness-injected user-role
+ * messages carry a typed `source` attribution; real user input is exactly:
+ * - { kind: "user" }                    — ACP prompt path (asar L311357)
+ * - { kind: "user", rpcId, … }          — user-rpc GUI path (MessageSourceMap,
+ *   asar L319043: 'user-rpc': { kind: "user"; rpcId; clientTimeZone?; principal? })
+ * - { kind: "user-question-reply", … }  — the user's typed answer to a
+ *   question tool call (asar L765126; content is the user's answer text)
+ * Everything else user-role is harness-internal: skill-catalog reminders
+ * (asar L1966055), agent-instructions baselines (asar L313984), time-context
+ * clock samples, runtime-context snapshots, compact-checkpoints, webhook /
+ * schedule / team messages, and kinds added in future host versions.
+ * v1.5.1 used a BLOCKLIST and leaked twice (forwarded the skills catalog and
+ * the workspace-instructions reminder because their kinds were unknown), so
+ * this is now a WHITELIST: forward only absent-source / "user" /
+ * "user-question-reply". Defensive: a user message with NO source object is
+ * still treated as real user input (test mocks and exotic bridges).
  */
-const SYNTHETIC_USER_SOURCE_KINDS = new Set(["runtime-context", "time-context", "compact-checkpoint"]);
-
-function isSyntheticUserMessage(message) {
-	const source = message?.source;
-	return typeof source === "object" && source !== null && typeof source.kind === "string" && SYNTHETIC_USER_SOURCE_KINDS.has(source.kind);
+function isForwardableUserMessage(message) {
+	if (message?.role !== "user") return false;
+	const source = message.source;
+	if (typeof source !== "object" || source === null) return true;
+	return source.kind === "user" || source.kind === "user-question-reply";
 }
 
 /**
@@ -455,7 +461,7 @@ function latestTurnPrompt(options) {
 	let lastUserIndex = -1;
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
 		const message = messages[index];
-		if (message?.role === "user" && !isSyntheticUserMessage(message)) {
+		if (message?.role === "user" && isForwardableUserMessage(message)) {
 			lastUserIndex = index;
 			break;
 		}
