@@ -29,6 +29,12 @@ import { LlmAdapter, LlmError, attributionHeaders, ToolCallId } from "@deepseek-
 /** Manus OpenAPI v2 origin (also the configurable-provider defaultBaseURL). */
 export const MANUS_API_BASE = "https://api.manus.ai";
 
+/**
+ * TTL for cached `usage.availableCredits` reads used by per-turn accounting
+ * (fetchCreditsCached). 30s matches the host-side credits-route cache.
+ */
+const CREDITS_TTL_MS = 30_000;
+
 /** Read a validated string field from provider JSON, or throw MALFORMED_RESPONSE. */
 function needString(value, what) {
 	if (typeof value !== "string" || value.length === 0) {
@@ -39,6 +45,50 @@ function needString(value, what) {
 
 function isObject(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Coerce a Manus numeric field to a finite number. The live API mixes plain
+ * numbers (`total_credits: 4063`) with numeric strings
+ * (`next_refresh_time: "1793318400"`), so both are accepted.
+ */
+function numberField(value) {
+	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+	if (typeof value === "string" && value.trim().length > 0) {
+		const parsed = Number(value);
+		return Number.isFinite(parsed) ? parsed : undefined;
+	}
+	return undefined;
+}
+
+/**
+ * The credits document. `usage.availableCredits` answers FLAT (fields at the
+ * top level next to `ok`/`request_id`); older docs nest them under `data`, so
+ * both shapes are accepted.
+ */
+function creditsPayload(raw) {
+	if (isObject(raw?.data)) return raw.data;
+	return isObject(raw) ? raw : undefined;
+}
+
+/** Parse a credits document into the readout shape, or undefined when unusable. */
+function parseCredits(raw) {
+	const data = creditsPayload(raw);
+	if (data === undefined) return undefined;
+	const total = numberField(data.total_credits);
+	if (total === undefined) return undefined;
+	const nextRefresh = numberField(data.next_refresh_time);
+	const periodEnd = numberField(data.current_period_end);
+	return {
+		total,
+		free: numberField(data.free_credits),
+		periodic: numberField(data.periodic_credits),
+		addon: numberField(data.addon_credits),
+		refresh: numberField(data.refresh_credits),
+		nextRefresh: nextRefresh !== undefined && nextRefresh > 0 ? nextRefresh : undefined,
+		refreshInterval: typeof data.refresh_interval === "string" ? data.refresh_interval : "",
+		periodEnd: periodEnd !== undefined && periodEnd > 0 ? periodEnd : undefined
+	};
 }
 
 /** Extract the standard {ok, error:{code,message}} Manus envelope, or null. */
@@ -311,24 +361,38 @@ var ManusAdapter = class extends LlmAdapter {
 					accept: "application/json"
 				}
 			}, undefined, timeoutMs);
-			const data = isObject(raw.data) ? raw.data : undefined;
-			if (data === undefined) return undefined;
-			const total = typeof data.total_credits === "number" ? data.total_credits : undefined;
-			if (total === undefined) return undefined;
-			return {
-				total,
-				free: typeof data.free_credits === "number" ? data.free_credits : undefined,
-				periodic: typeof data.periodic_credits === "number" ? data.periodic_credits : undefined,
-				addon: typeof data.addon_credits === "number" ? data.addon_credits : undefined,
-				refresh: typeof data.refresh_credits === "number" ? data.refresh_credits : undefined,
-				nextRefresh: typeof data.next_refresh_time === "number" && data.next_refresh_time > 0 ? data.next_refresh_time : undefined,
-				refreshInterval: typeof data.refresh_interval === "string" ? data.refresh_interval : "",
-				periodEnd: typeof data.current_period_end === "number" && data.current_period_end > 0 ? data.current_period_end : undefined
-			};
+			const parsed = parseCredits(raw);
+			if (parsed === undefined) return undefined;
+			return parsed;
 		} catch (error) {
 			this.log(`manus: credit read failed: ${error instanceof Error ? error.message : String(error)}`);
 			return undefined;
 		}
+	}
+
+	/**
+	 * TTL-cached balance read for per-turn accounting. Every generate() used to
+	 * hit `usage.availableCredits` twice (before + after the turn); the "before"
+	 * read now reuses a result fresher than {@link CREDITS_TTL_MS} and the
+	 * "after" read forces a fresh fetch so the turn's spend delta stays exact.
+	 * The cache is keyed per API key (multi-credential safe) and shared across
+	 * turns; it never serves stale data for the after-read.
+	 * @param apiKey - resolved credential value.
+	 * @param {object} [options]
+	 * @param {boolean} [options.fresh=false] - bypass the cache and repopulate
+	 *   it (used by the post-turn read).
+	 */
+	async fetchCreditsCached(apiKey, { fresh = false } = {}) {
+		const now = Date.now();
+		if (!fresh) {
+			const cached = this.creditsReadCache?.get(apiKey);
+			if (cached !== undefined && now - cached.at < CREDITS_TTL_MS) return cached.value;
+		}
+		const value = await this.fetchCredits(apiKey);
+		if (value !== undefined) {
+			(this.creditsReadCache ??= new Map()).set(apiKey, { at: Date.now(), value });
+		}
+		return value;
 	}
 
 	/** Bind one generation: config re-resolution happens before each dispatch. */
@@ -355,12 +419,11 @@ var ManusAdapter = class extends LlmAdapter {
 					accept: "application/json"
 				}
 			}, undefined, timeoutMs);
-			const data = isObject(raw.data) ? raw.data : undefined;
-			const total = typeof data?.total_credits === "number" ? data.total_credits : undefined;
-			if (total === undefined) {
+			const parsed = parseCredits(raw);
+			if (parsed === undefined) {
 				return { ok: false, code: "MALFORMED_RESPONSE", message: "Manus 返回了无法识别的余额数据" };
 			}
-			return { ok: true, total };
+			return { ok: true, total: parsed.total };
 		} catch (error) {
 			return {
 				ok: false,
@@ -402,9 +465,11 @@ var ManusAdapter = class extends LlmAdapter {
 		// route IS the agent_profile value; every other route keeps its tier.
 		const tier = config.tierOf(options.model, options.reasoningEffort);
 		const sessionId = typeof options.sessionId === "string" ? options.sessionId : "";
-		// Credit accounting is best-effort and never blocks a turn.
+		// Credit accounting is best-effort and never blocks a turn. The
+		// pre-turn read rides the TTL cache (free when another read just
+		// happened); the post-turn read forces fresh so the delta is exact.
 		let beforeCredits;
-		if (config.trackCredits) beforeCredits = await this.fetchCredits(apiKey, config.requestTimeoutMs);
+		if (config.trackCredits) beforeCredits = await this.fetchCreditsCached(apiKey);
 		if (taskId === undefined) {
 			const body = {
 				message: { content: prompt },
@@ -532,7 +597,7 @@ var ManusAdapter = class extends LlmAdapter {
 						// Measure the turn's spend now that the task settled. Best-effort:
 						// a failed read only means the readout shows no delta.
 						if (beforeCredits !== undefined) {
-							const after = await this.fetchCredits(apiKey, config.requestTimeoutMs);
+							const after = await this.fetchCreditsCached(apiKey, { fresh: true });
 							if (after !== undefined) {
 								const spent = beforeCredits.total - after.total;
 								if (Number.isFinite(spent)) this.credits?.record(sessionId, spent);

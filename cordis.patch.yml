@@ -2,7 +2,6 @@
     - id: manus-llm
       name: 'dsh-manus-llm'
       config:
-        apiKeyEnv: MANUS_API_KEY
         defaultProfile: max
         locale: zh-CN
         pollIntervalMs: 2000

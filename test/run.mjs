@@ -7,6 +7,7 @@ import { ManusAdapter } from "../adapter.js";
 // Mock mode switch: 'normal' streams progress + result with a paginated page
 // boundary; 'progressOnly' produces only progress frames then stops.
 let mode = "normal";
+let creditShape = "flat";
 let createBody = null;
 let creditCalls = 0;
 let totalCredits = 1000;
@@ -28,19 +29,21 @@ const server = http.createServer((req, res) => {
 			creditCalls += 1;
 			// Every read after the first sees 10 credits gone (a turn's spend).
 			if (creditCalls > 1) totalCredits = 990;
-			res.end(JSON.stringify({
-				ok: true,
-				data: {
-					total_credits: totalCredits,
-					free_credits: 100,
-					periodic_credits: 800,
-					addon_credits: 0,
-					refresh_credits: 50,
-					next_refresh_time: 1767000000,
-					refresh_interval: "daily",
-					current_period_end: 1768000000
-				}
-			}));
+			// FLAT body, exactly as the live endpoint answers: the credit fields
+			// sit at the top level next to ok/request_id, NOT under `data`.
+			const creditsBody = {
+				total_credits: totalCredits,
+				free_credits: 100,
+				periodic_credits: 800,
+				addon_credits: 0,
+				refresh_credits: 50,
+				next_refresh_time: "1767000000",
+				refresh_interval: "daily",
+				current_period_end: "1768000000"
+			};
+			res.end(JSON.stringify(creditShape === "nested"
+				? { ok: true, request_id: "rc1", data: creditsBody }
+				: { ok: true, request_id: "rc1", ...creditsBody }));
 		} else if (req.method === "GET" && url.pathname === "/v2/task.listMessages") {
 			const cursor = url.searchParams.get("start_event_id");
 			if (mode === "progressOnly") {
@@ -251,7 +254,29 @@ console.log("TURN3 TEXT (expect progress replay):", JSON.stringify(textOf(turn3)
 console.log("TURN3 CREDITS recorded:", JSON.stringify(recorded));
 mode = "normal";
 
-// 5. Error path: no API key (credentials + env both miss).
+// 5. Probe path: a FLAT credits body must read as a healthy connection.
+// This is the regression for 「检测连接：Manus 返回了无法识别的余额数据」 —
+// the old parser only looked under `data` and rejected the live shape.
+creditCalls = 0;
+totalCredits = 1000;
+const probeOk = await adapter.probe("test-key-123");
+console.log("PROBE ok:", probeOk.ok, "total:", probeOk.total, "code:", probeOk.code ?? "-");
+if (probeOk.ok !== true || probeOk.total !== 1000) {
+	console.log("PROBE: FAIL — flat credits body was not recognised");
+	process.exitCode = 1;
+}
+// Nested `data` (older docs) must still parse, so a shape change cannot regress.
+creditCalls = 0;
+creditShape = "nested";
+const probeNested = await adapter.probe("test-key-123");
+console.log("PROBE nested ok:", probeNested.ok, "total:", probeNested.total);
+if (probeNested.ok !== true) {
+	console.log("PROBE nested: FAIL — nested data shape no longer parses");
+	process.exitCode = 1;
+}
+creditShape = "flat";
+
+// 6. Error path: no API key (credentials + env both miss).
 const noKey = new ManusAdapter(() => ({ ...config }), async () => undefined, () => {}, credits);
 try {
 	for await (const chunk of noKey.generate({ provider: "manus", model: "standard", messages: [userMessage("hi")], signal: undefined })) {

@@ -27,6 +27,13 @@ export const name = "manus-llm";
 export const inject = ["llm"];
 
 const PROVIDER = "manus";
+/**
+ * The one place the key is stored. The reference name is a fixed implementation
+ * detail, not a user setting: exposing it as a read-only "credential reference"
+ * field only invited confusion (it could never be edited), so it is gone from
+ * the settings surface and lives here as a constant.
+ */
+const CREDENTIAL_REF = "MANUS_API_KEY";
 const CREDITS_PATH = "/plugins/manus-llm/credits";
 const CONFIG_PATH = "/plugins/manus-llm/config";
 const CREDENTIAL_PATH = "/plugins/manus-llm/credential";
@@ -68,12 +75,6 @@ function contextField() {
 }
 
 export const Config = z.object({
-	apiKeyEnv: z
-		.string()
-		.role("credential-ref")
-		.default("MANUS_API_KEY")
-		.volatile()
-		.description("存放 Manus API Key 的凭证名。通过「设置 → Manus」写入，无需改环境变量。"),
 	defaultProfile: z
 		.union([z.const("standard"), z.const("lite"), z.const("max")])
 		.default("max")
@@ -126,7 +127,12 @@ export const Config = z.object({
 		.default(false)
 		.volatile()
 		.description("是否把 Manus 的中间进度消息也流式输出到对话里。"),
-	verboseEvents: z.boolean().default(false).volatile().description("调试用：把非对话事件也写入日志。")
+	verboseEvents: z.boolean().default(false).volatile().description("调试用：把非对话事件也写入日志。"),
+	apiKeyLabel: z
+		.string()
+		.default("ManusApikey01")
+		.volatile()
+		.description("API Key 在账号页列表里显示的名称。")
 });
 
 function normalizeTier(model, fallback) {
@@ -171,7 +177,6 @@ async function readJsonBody(req, limitBytes = 8192) {
 
 /** Single-segment writable settings fields (nested modelContexts is special). */
 const WRITABLE_FIELDS = new Set([
-	"apiKeyEnv",
 	"defaultProfile",
 	"locale",
 	"pollIntervalMs",
@@ -181,7 +186,8 @@ const WRITABLE_FIELDS = new Set([
 	"trackCredits",
 	"creditPosition",
 	"showProgress",
-	"verboseEvents"
+	"verboseEvents",
+	"apiKeyLabel"
 ]);
 
 export function apply(ctx, config) {
@@ -209,7 +215,10 @@ export function apply(ctx, config) {
 		const fallbackTier = unwrap(config.defaultProfile, "max");
 		const windows = contextWindows();
 		return {
-			apiKeyEnv: unwrap(config.apiKeyEnv, "MANUS_API_KEY"),
+			// Internal only: the credential slot name the adapter resolves. It is
+			// deliberately absent from the Config schema and from the settings
+			// payload, so it can never show up as an editable "reference" field.
+			apiKeyEnv: CREDENTIAL_REF,
 			locale: unwrap(config.locale, "zh-CN"),
 			pollIntervalMs: unwrap(config.pollIntervalMs, 2000),
 			pollMaxSeconds: unwrap(config.pollMaxSeconds, 1200),
@@ -221,6 +230,7 @@ export function apply(ctx, config) {
 				: "composer",
 			showProgress: unwrap(config.showProgress, false) === true,
 			verboseEvents: unwrap(config.verboseEvents, false) === true,
+			apiKeyLabel: unwrap(config.apiKeyLabel, "ManusApikey01"),
 			models: MODEL_CATALOG,
 			reasoningEfforts: REASONING_EFFORTS,
 			contextWindows: windows,
@@ -299,6 +309,33 @@ export function apply(ctx, config) {
 	/** Last connection probe, kept in memory so the page can show it. */
 	let lastProbe;
 
+	/**
+	 * TTL cache for the Manus balance endpoint. Every client poll used to hit
+	 * `/v2/usage.availableCredits`; now concurrent callers share one upstream
+	 * call and repeats within `CREDITS_CACHE_TTL_MS` are served from memory,
+	 * so the 60s UI polling collapses to at most one upstream call per TTL
+	 * window no matter how many windows are open. Failures are cached too
+	 * (half TTL) so an erroring key does not trigger a retry storm.
+	 */
+	const CREDITS_CACHE_TTL_MS = 30_000;
+	const CREDITS_CACHE_ERROR_TTL_MS = 15_000;
+	let creditsCache;
+	async function fetchCreditsCached(apiKey) {
+		if (creditsCache !== undefined && Date.now() - creditsCache.at < (creditsCache.ok ? CREDITS_CACHE_TTL_MS : CREDITS_CACHE_ERROR_TTL_MS) && creditsCache.error === undefined) {
+			return creditsCache.value;
+		}
+		const pending = adapter.fetchCredits(apiKey);
+		creditsCache = { at: Date.now(), ok: true, value: pending };
+		try {
+			const value = await pending;
+			creditsCache = { at: Date.now(), ok: true, value };
+			return value;
+		} catch (error) {
+			creditsCache = { at: Date.now(), ok: false, value: undefined, error };
+			return undefined;
+		}
+	}
+
 	ctx.inject(["webServer"], (webCtx) => {
 		webCtx.effect(
 			() =>
@@ -316,7 +353,7 @@ export function apply(ctx, config) {
 						}
 						try {
 							const sessionId = new URL(req.url ?? "/", "http://localhost").searchParams.get("sessionId") ?? "";
-							const apiKey = await resolveApiKey(unwrap(config.apiKeyEnv, "MANUS_API_KEY"));
+							const apiKey = await resolveApiKey(CREDENTIAL_REF);
 							if (apiKey === undefined) {
 								json(res, 200, {
 									ok: false,
@@ -324,7 +361,7 @@ export function apply(ctx, config) {
 								});
 								return;
 							}
-							const balance = await adapter.fetchCredits(apiKey);
+							const balance = await fetchCreditsCached(apiKey);
 							const lastTurn = credits.lastTurn(sessionId);
 							json(res, 200, {
 								ok: true,
@@ -357,8 +394,7 @@ export function apply(ctx, config) {
 							return;
 						}
 						try {
-							const apiKeyEnv = unwrap(config.apiKeyEnv, "MANUS_API_KEY");
-							const apiKey = await resolveApiKey(apiKeyEnv);
+							const apiKey = await resolveApiKey(CREDENTIAL_REF);
 							if (apiKey === undefined) {
 								lastProbe = undefined;
 								json(res, 200, {
@@ -371,6 +407,19 @@ export function apply(ctx, config) {
 							}
 							if (req.method === "GET") {
 								json(res, 200, { ok: true, configured: true, ...(lastProbe === undefined ? {} : { probe: lastProbe }) });
+								return;
+							}
+							// POST probe: reuse the credits TTL cache when fresh —
+							// a probe and a balance poll hit the same upstream
+							// endpoint, so a recent successful read doubles as a
+							// successful probe without a second Manus call.
+							const cached = creditsCache !== undefined && creditsCache.error === undefined && Date.now() - creditsCache.at < CREDITS_CACHE_TTL_MS && creditsCache.value !== undefined
+								? await creditsCache.value
+								: undefined;
+							if (cached !== undefined) {
+								const probe = { ok: true, total: cached.total };
+								lastProbe = probe;
+								json(res, 200, { ok: true, configured: true, connected: true, probe });
 								return;
 							}
 							const probe = await adapter.probe(apiKey);
@@ -405,7 +454,6 @@ export function apply(ctx, config) {
 						}
 						const settings = ctx.get("settings");
 						const credentials = ctx.get("credentials");
-						const apiKeyEnv = unwrap(config.apiKeyEnv, "MANUS_API_KEY");
 
 						if (req.method === "GET") {
 							let revision;
@@ -416,7 +464,7 @@ export function apply(ctx, config) {
 							}
 							let credential;
 							try {
-								credential = await credentials?.describe?.(apiKeyEnv);
+								credential = await credentials?.describe?.(CREDENTIAL_REF);
 							} catch {
 								credential = undefined;
 							}
@@ -427,7 +475,6 @@ export function apply(ctx, config) {
 								revision,
 								credential: credential ?? { configured: false, writable: true },
 								values: {
-									apiKeyEnv: conf.apiKeyEnv,
 									defaultProfile: unwrap(config.defaultProfile, "max"),
 									locale: conf.locale,
 									pollIntervalMs: conf.pollIntervalMs,
@@ -438,7 +485,8 @@ export function apply(ctx, config) {
 									trackCredits: conf.trackCredits,
 									creditPosition: conf.creditPosition,
 									showProgress: conf.showProgress,
-									verboseEvents: conf.verboseEvents
+									verboseEvents: conf.verboseEvents,
+									apiKeyLabel: conf.apiKeyLabel
 								},
 								contextOptions: CONTEXT_OPTIONS,
 								models: MODEL_CATALOG,
@@ -524,11 +572,10 @@ export function apply(ctx, config) {
 							json(res, 503, { ok: false, error: { code: "credentials-unavailable", message: "凭证服务不可用" } });
 							return;
 						}
-						const apiKeyEnv = unwrap(config.apiKeyEnv, "MANUS_API_KEY");
 
 						if (req.method === "GET") {
-							const credential = await credentials.describe(apiKeyEnv).catch(() => undefined);
-							json(res, 200, { ok: true, apiKeyEnv, credential: credential ?? { configured: false, writable: true } });
+							const credential = await credentials.describe(CREDENTIAL_REF).catch(() => undefined);
+							json(res, 200, { ok: true, credential: credential ?? { configured: false, writable: true } });
 							return;
 						}
 
@@ -536,10 +583,10 @@ export function apply(ctx, config) {
 						const clear = req.method === "DELETE" || (req.method === "POST" && url.searchParams.get("action") === "clear");
 						if (clear) {
 							try {
-								await credentials.unset(apiKeyEnv);
+								await credentials.unset(CREDENTIAL_REF);
 								lastProbe = undefined;
-								const credential = await credentials.describe(apiKeyEnv).catch(() => undefined);
-								json(res, 200, { ok: true, apiKeyEnv, credential: credential ?? { configured: false, writable: true } });
+								const credential = await credentials.describe(CREDENTIAL_REF).catch(() => undefined);
+								json(res, 200, { ok: true, credential: credential ?? { configured: false, writable: true } });
 							} catch (error) {
 								json(res, 500, { ok: false, error: { code: "credential-unset-failed", message: safeMessage(error) } });
 							}
@@ -562,10 +609,10 @@ export function apply(ctx, config) {
 							return;
 						}
 						try {
-							await credentials.set(apiKeyEnv, value);
+							await credentials.set(CREDENTIAL_REF, value);
 							lastProbe = undefined;
-							const credential = await credentials.describe(apiKeyEnv).catch(() => undefined);
-							json(res, 200, { ok: true, apiKeyEnv, credential: credential ?? { configured: false, writable: true } });
+							const credential = await credentials.describe(CREDENTIAL_REF).catch(() => undefined);
+							json(res, 200, { ok: true, credential: credential ?? { configured: false, writable: true } });
 						} catch (error) {
 							json(res, 500, { ok: false, error: { code: "credential-write-failed", message: safeMessage(error) } });
 						}

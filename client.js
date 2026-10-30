@@ -15,8 +15,12 @@ window.__ModuleLoader__.load({
 		const TEST_PATH = "/plugins/manus-llm/test";
 		/** The provider route key this plugin owns. */
 		const PROVIDER = "manus";
-		/** Balance refresh cadence: a balance moves only when a turn spends. */
-		const REFRESH_INTERVAL_MS = 60000;
+		/** Balance refresh cadence while the page is visible: 10 minutes. A
+		 * balance only moves when a turn spends, and each poll costs an
+		 * upstream read, so visible-tab polling stays slow. */
+		const REFRESH_INTERVAL_MS = 600000;
+		/** The credit-position readout is host-local config (free): keep it nimble. */
+		const POSITION_REFRESH_INTERVAL_MS = 60000;
 		/** Settings namespace for the client-side copy. */
 		const NAMESPACE = "manus-llm";
 
@@ -67,18 +71,29 @@ window.__ModuleLoader__.load({
 			"settings.key.configured": "已配置（来源：{source}）",
 			"settings.key.missing": "未配置",
 			"settings.key.save": "保存 Key",
-			"settings.key.clear": "清除",
 			"settings.key.saved": "API Key 已保存。",
 			"settings.key.cleared": "API Key 已清除。",
 			"settings.key.empty": "API Key 不能为空。",
-			"settings.key.hint": "Key 保存在本机凭证库，不会离开 DSH 宿主进程。",
-			"settings.key.env": "凭证引用名",
+			"settings.key.hint": "Key 保存在本机凭证库，不会离开 DSH 宿主进程。{credential}",
+			"settings.key.hintPlain": "Key 保存在本机凭证库，不会离开 DSH 宿主进程。",
 			"settings.key.test": "检测连接",
+			"settings.key.testIcon": "检测连接",
 			"settings.key.testing": "检测中…",
 			"settings.key.connected": "已连接 · 余额 {total}",
 			"settings.key.disconnected": "未连接",
 			"settings.key.untested": "尚未检测",
 			"settings.key.testFailed": "连接失败：{message}",
+			"settings.key.table.name": "名称",
+			"settings.key.table.status": "状态",
+			"settings.key.table.actions": "操作",
+			"settings.key.rename": "重命名",
+			"settings.key.renameSave": "确认",
+			"settings.key.renameCancel": "取消",
+			"settings.key.delete": "删除",
+			"settings.key.deleteConfirmTitle": "删除 API Key",
+			"settings.key.deleteConfirmBody": "确定要删除已保存的 API Key 吗？删除后需要重新输入才能继续使用。",
+			"settings.key.labelSaved": "名称已保存。",
+			"settings.key.labelEmpty": "名称不能为空。",
 
 			"settings.account.title": "账号与运行参数",
 			"settings.account.default": "默认模型档位",
@@ -145,18 +160,29 @@ window.__ModuleLoader__.load({
 			"settings.key.configured": "Configured (source: {source})",
 			"settings.key.missing": "Not configured",
 			"settings.key.save": "Save key",
-			"settings.key.clear": "Clear",
 			"settings.key.saved": "API key saved.",
 			"settings.key.cleared": "API key cleared.",
 			"settings.key.empty": "The API key cannot be empty.",
-			"settings.key.hint": "The key is stored in the local credential store and never leaves the DSH host process.",
-			"settings.key.env": "Credential reference",
+			"settings.key.hint": "The key is stored in the local credential store and never leaves the DSH host process. {credential}",
+			"settings.key.hintPlain": "The key is stored in the local credential store and never leaves the DSH host process.",
 			"settings.key.test": "Test connection",
+			"settings.key.testIcon": "Test connection",
 			"settings.key.testing": "Testing…",
 			"settings.key.connected": "Connected · {total} credits",
 			"settings.key.disconnected": "Not connected",
 			"settings.key.untested": "Not tested yet",
 			"settings.key.testFailed": "Connection failed: {message}",
+			"settings.key.table.name": "Name",
+			"settings.key.table.status": "Status",
+			"settings.key.table.actions": "Actions",
+			"settings.key.rename": "Rename",
+			"settings.key.renameSave": "Confirm",
+			"settings.key.renameCancel": "Cancel",
+			"settings.key.delete": "Delete",
+			"settings.key.deleteConfirmTitle": "Delete API key",
+			"settings.key.deleteConfirmBody": "Delete the saved API key? You will need to paste it again to keep using Manus.",
+			"settings.key.labelSaved": "Name saved.",
+			"settings.key.labelEmpty": "The name cannot be empty.",
 
 			"settings.account.title": "Account and runtime",
 			"settings.account.default": "Default model tier",
@@ -196,15 +222,15 @@ window.__ModuleLoader__.load({
 .dsm-manus-credits-dot[data-tone="warn"]{background:var(--dsw-alias-state-warn-secondary,#fbbf24)}
 .dsm-manus-credits-dot[data-tone="error"]{background:var(--dsw-alias-state-error-primary,#d92d20)}
 .dsm-manus-credits-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-.dsm-manus-credits-panel{position:fixed;z-index:1100;box-sizing:border-box;width:min(248px,calc(100vw - 24px));padding:12px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));border-radius:var(--dsw-radius-lg,14px);background:var(--dsw-specific-menu,Canvas);box-shadow:var(--dsw-elevation-prominent,0 8px 24px rgba(0,0,0,.16));font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary,#444)}
-.dsm-manus-credits-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:8px;margin-bottom:8px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));font-weight:600;color:var(--dsw-alias-label-primary,#111)}
+.dsm-manus-credits-panel{position:fixed;z-index:1100;box-sizing:border-box;width:min(248px,calc(100vw - 24px));padding:12px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));border-radius:var(--dsw-radius-lg,14px);background:linear-gradient(var(--dsw-specific-menu,Canvas),var(--dsw-specific-menu,Canvas)),var(--dsw-alias-bg-primary,Canvas);box-shadow:var(--dsw-elevation-prominent,0 8px 24px rgba(0,0,0,.16));font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary,#444)}
+.dsm-manus-credits-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding-bottom:8px;margin-bottom:8px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));font-weight:600;color:var(--dsw-alias-label-primary,#111)}
 .dsm-manus-credits-row{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:3px 0}
-.dsm-manus-credits-key{color:var(--dsw-alias-label-tertiary,#999)}
-.dsm-manus-credits-value{font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary,#111)}
+.dsm-manus-credits-key{flex:none;color:var(--dsw-alias-label-tertiary,#999)}
+.dsm-manus-credits-value{flex:none;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary,#111)}
 .dsm-manus-credits-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;padding-top:8px;margin-top:8px;border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24))}
-.dsm-manus-credits-action{appearance:none;padding:2px 8px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));border-radius:6px;background:transparent;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary,#444);cursor:pointer}
-.dsm-manus-credits-error{color:var(--dsw-alias-state-error-primary,#d92d20)}
-.dsm-manus-credits-hint{color:var(--dsw-alias-label-tertiary,#999);font-size:11px;line-height:16px}
+.dsm-manus-credits-action{flex:none;white-space:nowrap;appearance:none;padding:2px 8px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));border-radius:6px;background:transparent;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary,#444);cursor:pointer}
+.dsm-manus-credits-error{color:var(--dsw-alias-state-error-primary,#d92d20);overflow-wrap:anywhere}
+.dsm-manus-credits-hint{min-width:0;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary,#999);font-size:11px;line-height:16px}
 .dsm-manus-settings{display:flex;flex-direction:column;gap:12px;padding:2px 2px 16px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary,#444)}
 .dsm-manus-settings-head{display:flex;flex-direction:column;gap:2px}
 .dsm-manus-settings-title{font-size:15px;line-height:22px;font-weight:600;color:var(--dsw-alias-label-primary,#111)}
@@ -218,7 +244,9 @@ window.__ModuleLoader__.load({
 .dsm-manus-settings-field{display:flex;flex-direction:column;gap:4px}
 .dsm-manus-settings-label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary,#444)}
 .dsm-manus-settings-control{box-sizing:border-box;width:100%;padding:5px 8px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));border-radius:8px;background:var(--dsw-alias-bg-l1,Canvas);font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary,#111)}
-.dsm-manus-settings-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.dsm-manus-settings-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.dsm-manus-settings-row > .dsm-manus-settings-control{flex:1 1 120px;width:auto;min-width:0}
+.dsm-manus-settings-row > .dsm-manus-settings-field{flex:1 1 140px;min-width:0}
 .dsm-manus-settings-check{display:flex;align-items:center;gap:6px;font-size:12px;line-height:18px}
 .dsm-manus-settings-hint{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#999)}
 .dsm-manus-settings-state{display:inline-flex;align-items:center;gap:6px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary,#999)}
@@ -235,7 +263,7 @@ window.__ModuleLoader__.load({
 .dsm-manus-segment[data-active="true"]{background:var(--dsw-specific-menu,Canvas);color:var(--dsw-alias-label-primary,#111);font-weight:600}
 .dsm-manus-segment:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#5686fe);outline-offset:1px}
 .dsm-manus-settings-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.dsm-manus-settings-button{appearance:none;padding:5px 14px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));border-radius:8px;background:transparent;font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary,#111);cursor:pointer}
+.dsm-manus-settings-button{flex:none;white-space:nowrap;appearance:none;padding:5px 14px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));border-radius:8px;background:transparent;font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary,#111);cursor:pointer}
 .dsm-manus-settings-button[data-variant="primary"]{border-color:transparent;background:var(--dsw-alias-brand-primary,#5686fe);color:#fff}
 .dsm-manus-settings-button[data-variant="danger"]{border-color:transparent;background:transparent;color:var(--dsw-alias-state-error-primary,#d92d20)}
 .dsm-manus-settings-button:disabled{opacity:.5;cursor:default}
@@ -243,6 +271,26 @@ window.__ModuleLoader__.load({
 .dsm-manus-settings-feedback[data-tone="ok"]{color:var(--dsw-alias-state-success-primary,#22c55e)}
 .dsm-manus-settings-feedback[data-tone="error"]{color:var(--dsw-alias-state-error-primary,#d92d20)}
 .dsm-manus-settings-feedback[data-tone="warn"]{color:var(--dsw-alias-state-warn-secondary,#fbbf24)}
+.dsm-manus-keylist{width:100%;border-collapse:collapse;font-size:12px;line-height:18px}
+.dsm-manus-keylist th{text-align:left;padding:4px 8px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));font-weight:600;color:var(--dsw-alias-label-tertiary,#999);white-space:nowrap}
+.dsm-manus-keylist th.dsm-manus-keylist-head-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px}
+.dsm-manus-keylist td{padding:6px 8px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.16));vertical-align:middle}
+.dsm-manus-keylist tr:last-child td{border-bottom:0}
+.dsm-manus-keylist-name{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;color:var(--dsw-alias-label-primary,#111)}
+.dsm-manus-keylist-actions{display:flex;align-items:center;gap:4px;justify-content:flex-end;white-space:nowrap}
+.dsm-manus-settings-icon{flex:none;display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary,#444);cursor:pointer}
+.dsm-manus-settings-icon:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.14))}
+.dsm-manus-settings-icon:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#5686fe);outline-offset:1px}
+.dsm-manus-settings-icon:disabled{opacity:.5;cursor:default}
+.dsm-manus-settings-icon[data-variant="danger"]{color:var(--dsw-alias-state-error-primary,#d92d20)}
+.dsm-manus-settings-icon svg{display:block}
+.dsm-manus-keylist-edit{display:flex;align-items:center;gap:6px;min-width:0}
+.dsm-manus-keylist-edit .dsm-manus-settings-control{width:180px;padding:3px 8px;font-size:12px;line-height:18px}
+.dsm-manus-overlay{position:fixed;inset:0;z-index:1200;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.4);padding:16px}
+.dsm-manus-overlay-card{box-sizing:border-box;width:min(360px,100%);padding:16px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));border-radius:var(--dsw-radius-lg,14px);background:var(--dsw-specific-menu,Canvas);box-shadow:var(--dsw-elevation-prominent,0 8px 24px rgba(0,0,0,.16));display:flex;flex-direction:column;gap:10px}
+.dsm-manus-overlay-title{font-size:14px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary,#111)}
+.dsm-manus-overlay-body{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary,#444)}
+.dsm-manus-overlay-actions{display:flex;justify-content:flex-end;gap:8px}
 `;
 
 		if (typeof document !== "undefined") {
@@ -394,13 +442,34 @@ window.__ModuleLoader__.load({
 
 			react.useEffect(() => {
 				load();
-				const ticker = window.setInterval(load, REFRESH_INTERVAL_MS);
-				return () => window.clearInterval(ticker);
+				// Credit-saving: while the DSH window is hidden there is nobody
+				// looking at the readout, so the 60s poll pauses entirely and
+				// resumes (with one immediate load) when the page turns visible.
+				// Every poll still costs a (now 30s-cached) upstream read, so
+				// hidden tabs must not burn balance probes.
+				let ticker;
+				const onVisibility = () => {
+					if (document.hidden) {
+						window.clearInterval(ticker);
+						ticker = undefined;
+						return;
+					}
+					if (ticker === undefined) {
+						load();
+						ticker = window.setInterval(load, REFRESH_INTERVAL_MS);
+					}
+				};
+				ticker = window.setInterval(load, REFRESH_INTERVAL_MS);
+				document.addEventListener("visibilitychange", onVisibility);
+				return () => {
+					document.removeEventListener("visibilitychange", onVisibility);
+					window.clearInterval(ticker);
+				};
 			}, [load]);
 
 			const running = useSession?.((snapshot) => snapshot.running === true) === true;
 			react.useEffect(() => {
-				if (running) return;
+				if (running || document.hidden) return;
 				const timer = window.setTimeout(load, 1200);
 				return () => window.clearTimeout(timer);
 			}, [running, load]);
@@ -535,11 +604,16 @@ window.__ModuleLoader__.load({
 		 * account tab (API key, locale, credits position, compact runtime options).
 		 */
 		function ManusSettings({ t }) {
-			const [tab, setTab] = react.useState("models");
+			// Tabs read 账号 → 模型: account is the first tab and the one a fresh
+			// install lands on, since a key must be configured before models matter.
+			const [tab, setTab] = react.useState("account");
 			const [config, setConfig] = react.useState({ status: "loading", revision: undefined, values: {}, credential: undefined, models: [], error: undefined });
 			const [draft, setDraft] = react.useState({});
 			const [contexts, setContexts] = react.useState({});
 			const [keyValue, setKeyValue] = react.useState("");
+			const [keyLabel, setKeyLabel] = react.useState("ManusApikey01");
+			const [editingLabel, setEditingLabel] = react.useState(false);
+			const [confirmDelete, setConfirmDelete] = react.useState(false);
 			const [feedback, setFeedback] = react.useState(undefined);
 			const [probe, setProbe] = react.useState({ status: "idle", ok: undefined, total: undefined, message: undefined });
 			const [busy, setBusy] = react.useState(false);
@@ -572,8 +646,10 @@ window.__ModuleLoader__.load({
 					trackCredits: values.trackCredits,
 					showProgress: values.showProgress,
 					verboseEvents: values.verboseEvents,
-					creditPosition: values.creditPosition
+					creditPosition: values.creditPosition,
+					apiKeyLabel: values.apiKeyLabel
 				});
+				setKeyLabel(typeof values.apiKeyLabel === "string" && values.apiKeyLabel.trim().length > 0 ? values.apiKeyLabel : "ManusApikey01");
 				const windows = values.modelContexts ?? {};
 				const nextContexts = {};
 				for (const model of Array.isArray(body.models) ? body.models : []) {
@@ -604,11 +680,21 @@ window.__ModuleLoader__.load({
 
 			react.useEffect(() => {
 				reload();
+				// Credit-saving: adopt the last server-side probe (GET /test is
+				// served from memory and never calls Manus) so the status column
+				// can show a real connection state without a fresh API call.
+				fetch(TEST_PATH, { headers: { accept: "application/json" }, credentials: "same-origin" })
+					.then((response) => response.json().catch(() => undefined))
+					.then((body) => {
+						if (!mounted.current || body?.ok !== true || body.probe === undefined || body.probe === null) return;
+						setProbe({ status: "done", ok: body.probe.ok === true, total: body.probe.total, message: body.probe.message });
+					})
+					.catch(() => undefined);
 			}, [reload]);
 
 			const setField = (key, value) => setDraft((current) => ({ ...current, [key]: value }));
 
-			const accountKeys = ["defaultProfile", "locale", "pollIntervalMs", "pollMaxSeconds", "requestTimeoutMs", "maxTokens", "trackCredits", "showProgress", "verboseEvents", "creditPosition"];
+			const accountKeys = ["defaultProfile", "locale", "pollIntervalMs", "pollMaxSeconds", "requestTimeoutMs", "maxTokens", "trackCredits", "showProgress", "verboseEvents", "creditPosition", "apiKeyLabel"];
 			const unsavedAccount = accountKeys.some((key) => draft[key] !== config.values?.[key]);
 			const unsavedModels = Object.keys(contexts).some((model) => contexts[model] !== (config.values?.modelContexts?.[model] ?? 1000000));
 
@@ -729,19 +815,42 @@ window.__ModuleLoader__.load({
 				}
 			};
 
+			const saveKeyLabel = async () => {
+				const label = keyLabel.trim();
+				if (label.length === 0) {
+					setFeedback({ tone: "error", text: t("settings.key.labelEmpty") });
+					return;
+				}
+				if (await write([{ op: "set", path: ["apiKeyLabel"], value: label }])) {
+					setEditingLabel(false);
+					setFeedback({ tone: "ok", text: t("settings.key.labelSaved") });
+				}
+			};
+
+			// Status column shows the CONNECTION state, not the configured state:
+			// testing → 检测中；done+ok → 已连接 · 余额 N；done+fail → 失败原因；
+			// untested → fall back to a neutral 「未检测」 instead of the configured
+			// badge (which lives in the hint row only).
 			const credentialText = config.credential?.configured === true
 				? t("settings.key.configured", { source: config.credential.source ?? "file" })
 				: t("settings.key.missing");
-			const keyTone = config.credential?.configured === true ? "ok" : "warn";
-
-			const probeText = probe.status === "testing"
+			const hintKey = config.credential?.configured === true ? "settings.key.hint" : "settings.key.hintPlain";
+			const statusText = probe.status === "testing"
 				? t("settings.key.testing")
 				: probe.status === "done"
 					? probe.ok === true
 						? t("settings.key.connected", { total: formatCredits(probe.total) ?? "—" })
 						: t("settings.key.testFailed", { message: probe.message ?? t("settings.key.disconnected") })
-					: t("settings.key.untested");
-			const probeTone = probe.status === "done" ? (probe.ok === true ? "ok" : "error") : "warn";
+					: config.credential?.configured === true
+						? t("settings.key.untested")
+						: t("settings.key.missing");
+			const statusTone = probe.status === "testing"
+				? "warn"
+				: probe.status === "done"
+					? (probe.ok === true ? "ok" : "error")
+					: config.credential?.configured === true
+						? "warn"
+						: "error";
 
 			const head = jsx.jsxs("div", {
 				className: "dsm-manus-settings-head",
@@ -758,18 +867,18 @@ window.__ModuleLoader__.load({
 					jsx.jsx("button", {
 						type: "button",
 						className: "dsm-manus-tab",
-						"data-active": tab === "models",
-						role: "tab",
-						onClick: () => setTab("models"),
-						children: t("settings.tab.models")
-					}),
-					jsx.jsx("button", {
-						type: "button",
-						className: "dsm-manus-tab",
 						"data-active": tab === "account",
 						role: "tab",
 						onClick: () => setTab("account"),
 						children: t("settings.tab.account")
+					}),
+					jsx.jsx("button", {
+						type: "button",
+						className: "dsm-manus-tab",
+						"data-active": tab === "models",
+						role: "tab",
+						onClick: () => setTab("models"),
+						children: t("settings.tab.models")
 					})
 				]
 			});
@@ -853,25 +962,6 @@ window.__ModuleLoader__.load({
 					jsx.jsxs("div", {
 						className: "dsm-manus-settings-row",
 						children: [
-							jsx.jsxs("span", {
-								className: "dsm-manus-settings-state",
-								children: [
-									jsx.jsx("span", { className: "dsm-manus-settings-dot", "data-tone": keyTone }),
-									credentialText
-								]
-							}),
-							jsx.jsxs("span", {
-								className: "dsm-manus-settings-state",
-								children: [
-									jsx.jsx("span", { className: "dsm-manus-settings-dot", "data-tone": probeTone }),
-									probeText
-								]
-							})
-						]
-					}),
-					jsx.jsxs("div", {
-						className: "dsm-manus-settings-row",
-						children: [
 							jsx.jsx("input", {
 								type: "password",
 								className: "dsm-manus-settings-control",
@@ -887,35 +977,199 @@ window.__ModuleLoader__.load({
 								disabled: busy || keyValue.trim().length === 0,
 								onClick: () => saveKey(),
 								children: t("settings.key.save")
-							}),
-							jsx.jsx("button", {
-								type: "button",
-								className: "dsm-manus-settings-button",
-								"data-variant": "danger",
-								disabled: busy || config.credential?.configured !== true,
-								onClick: () => clearKey(),
-								children: t("settings.key.clear")
-							}),
-							jsx.jsx("button", {
-								type: "button",
-								className: "dsm-manus-settings-button",
-								disabled: probe.status === "testing" || config.credential?.configured !== true,
-								onClick: () => testKey(),
-								children: t("settings.key.test")
 							})
 						]
 					}),
-					jsx.jsx("div", { className: "dsm-manus-settings-hint", children: t("settings.key.hint") }),
-					jsx.jsx(Field, {
-						label: t("settings.key.env"),
-						hint: "MANUS_API_KEY",
-						children: jsx.jsx("input", {
-							type: "text",
-							className: "dsm-manus-settings-control",
-							value: draft.apiKeyEnv ?? config.values?.apiKeyEnv ?? "MANUS_API_KEY",
-							readOnly: true
-						})
+					jsx.jsxs("table", {
+						className: "dsm-manus-keylist",
+						children: [
+							jsx.jsxs("thead", {
+								children: jsx.jsxs("tr", {
+									children: [
+										jsx.jsx("th", { scope: "col", children: t("settings.key.table.name") }),
+										jsx.jsx("th", { scope: "col", children: t("settings.key.table.status") }),
+										jsx.jsxs("th", {
+											scope: "col",
+											className: "dsm-manus-keylist-head-actions",
+											children: [
+												t("settings.key.table.actions"),
+												jsx.jsx("button", {
+													type: "button",
+													className: "dsm-manus-settings-icon",
+													"aria-label": t("settings.key.testIcon"),
+													title: t("settings.key.testIcon"),
+													disabled: probe.status === "testing" || config.credential?.configured !== true,
+													onClick: () => testKey(),
+													children: jsx.jsxs("svg", {
+														width: 14,
+														height: 14,
+														viewBox: "0 0 24 24",
+														fill: "none",
+														stroke: "currentColor",
+														"stroke-width": 2,
+														"stroke-linecap": "round",
+														"stroke-linejoin": "round",
+														"aria-hidden": "true",
+														children: [
+															jsx.jsx("path", { d: "M22 11.08V12a10 10 0 1 1-5.93-9.14" }),
+															jsx.jsx("polyline", { points: "22 4 12 14.01 9 11.01" })
+														]
+													})
+												})
+											]
+										})
+									]
+								})
+							}),
+							jsx.jsxs("tbody", {
+								children: jsx.jsxs("tr", {
+									children: [
+										jsx.jsxs("td", {
+											className: "dsm-manus-keylist-name",
+											title: keyLabel,
+											children: editingLabel
+												? jsx.jsxs("span", {
+													className: "dsm-manus-keylist-edit",
+													children: [
+														jsx.jsx("input", {
+															type: "text",
+															className: "dsm-manus-settings-control",
+															value: keyLabel,
+															autoComplete: "off",
+															maxLength: 40,
+															"aria-label": t("settings.key.rename"),
+															onChange: (event) => setKeyLabel(event.target.value),
+															onKeyDown: (event) => {
+																if (event.key === "Enter") saveKeyLabel();
+																if (event.key === "Escape") setEditingLabel(false);
+															}
+														}),
+														jsx.jsx("button", {
+															type: "button",
+															className: "dsm-manus-settings-button",
+															"data-variant": "primary",
+															disabled: busy,
+															onClick: () => saveKeyLabel(),
+															children: t("settings.key.renameSave")
+														}),
+														jsx.jsx("button", {
+															type: "button",
+															className: "dsm-manus-settings-button",
+															disabled: busy,
+															onClick: () => setEditingLabel(false),
+															children: t("settings.key.renameCancel")
+														})
+													]
+												})
+												: keyLabel
+										}),
+										jsx.jsxs("td", {
+											children: jsx.jsxs("span", {
+												className: "dsm-manus-settings-state",
+												children: [
+													jsx.jsx("span", { className: "dsm-manus-settings-dot", "data-tone": statusTone }),
+													statusText
+												]
+											})
+										}),
+										jsx.jsxs("td", {
+											className: "dsm-manus-keylist-actions",
+											children: [
+												jsx.jsx("button", {
+													type: "button",
+													className: "dsm-manus-settings-icon",
+													"aria-label": t("settings.key.rename"),
+													title: t("settings.key.rename"),
+													disabled: busy || config.credential?.configured !== true,
+													onClick: () => setEditingLabel(true),
+													children: jsx.jsxs("svg", {
+														width: 14,
+														height: 14,
+														viewBox: "0 0 24 24",
+														fill: "none",
+														stroke: "currentColor",
+														"stroke-width": 2,
+														"stroke-linecap": "round",
+														"stroke-linejoin": "round",
+														"aria-hidden": "true",
+														children: jsx.jsx("path", { d: "M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" })
+													})
+												}),
+												jsx.jsx("button", {
+													type: "button",
+													className: "dsm-manus-settings-icon",
+													"data-variant": "danger",
+													"aria-label": t("settings.key.delete"),
+													title: t("settings.key.delete"),
+													disabled: busy || config.credential?.configured !== true,
+													onClick: () => setConfirmDelete(true),
+													children: jsx.jsxs("svg", {
+														width: 14,
+														height: 14,
+														viewBox: "0 0 24 24",
+														fill: "none",
+														stroke: "currentColor",
+														"stroke-width": 2,
+														"stroke-linecap": "round",
+														"stroke-linejoin": "round",
+														"aria-hidden": "true",
+														children: [
+															jsx.jsx("polyline", { points: "3 6 5 6 21 6" }),
+															jsx.jsx("path", { d: "M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m5 0V4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v2" })
+														]
+													})
+												})
+											]
+										})
+									]
+								})
+							})
+						]
 					}),
+					jsx.jsx("div", { className: "dsm-manus-settings-hint", children: t(hintKey, { credential: credentialText }) }),
+					confirmDelete
+						? jsx.jsxs("div", {
+							className: "dsm-manus-overlay",
+							role: "presentation",
+							onClick: () => {
+								if (!busy) setConfirmDelete(false);
+							},
+							children: jsx.jsxs("div", {
+								className: "dsm-manus-overlay-card",
+								role: "dialog",
+								"aria-modal": "true",
+								"aria-label": t("settings.key.deleteConfirmTitle"),
+								onClick: (event) => event.stopPropagation(),
+								children: [
+									jsx.jsx("div", { className: "dsm-manus-overlay-title", children: t("settings.key.deleteConfirmTitle") }),
+									jsx.jsx("div", { className: "dsm-manus-overlay-body", children: t("settings.key.deleteConfirmBody") }),
+									jsx.jsxs("div", {
+										className: "dsm-manus-overlay-actions",
+										children: [
+											jsx.jsx("button", {
+												type: "button",
+												className: "dsm-manus-settings-button",
+												disabled: busy,
+												onClick: () => setConfirmDelete(false),
+												children: t("settings.key.renameCancel")
+											}),
+											jsx.jsx("button", {
+												type: "button",
+												className: "dsm-manus-settings-button",
+												"data-variant": "danger",
+												disabled: busy,
+												onClick: () => {
+													setConfirmDelete(false);
+													clearKey();
+												},
+												children: t("settings.key.delete")
+											})
+										]
+									})
+								]
+							})
+						})
+						: null,
 					jsx.jsx("div", { className: "dsm-manus-settings-group-title", children: t("settings.account.title") }),
 					jsx.jsxs("div", {
 						className: "dsm-manus-settings-row",
@@ -1029,17 +1283,15 @@ window.__ModuleLoader__.load({
 
 		/**
 		 * Decide which composer seat this readout occupies. The position comes
-		 * from the plugin settings (`creditPosition`), cached briefly so a seat
-		 * render does not hit the Host on every keystroke.
+		 * from the plugin settings (`creditPosition`) and is held in component
+		 * state: a value cached outside React could resolve *after* the first
+		 * render without ever re-rendering, which left the readout invisible
+		 * when the seat and the setting disagreed on that first pass.
 		 */
 		const positionCache = { value: undefined, at: 0 };
-		function readCreditPosition() {
+		function refreshCreditPosition(force) {
 			const now = Date.now();
-			if (positionCache.value !== undefined && now - positionCache.at < REFRESH_INTERVAL_MS) return positionCache.value;
-			return positionCache.value;
-		}
-		function refreshCreditPosition() {
-			if (positionCache.value !== undefined && Date.now() - positionCache.at < 5000) return;
+			if (!force && positionCache.value !== undefined && now - positionCache.at < 5000) return;
 			fetch(CONFIG_PATH, { headers: { accept: "application/json" }, credentials: "same-origin" })
 				.then((response) => response.json())
 				.then((body) => {
@@ -1053,14 +1305,29 @@ window.__ModuleLoader__.load({
 		/** Render the readout only in the seat the settings select. */
 		function ManusCreditsGate(props) {
 			const { t, position, useProjection, useSession } = props;
+			const [wanted, setWanted] = react.useState(() => positionCache.value);
+			react.useEffect(() => {
+				let live = true;
+				const read = () => {
+					if (!live) return;
+					if (positionCache.value !== undefined) setWanted(positionCache.value);
+					refreshCreditPosition(false);
+				};
+				read();
+				const ticker = window.setInterval(read, POSITION_REFRESH_INTERVAL_MS);
+				return () => {
+					live = false;
+					window.clearInterval(ticker);
+				};
+			}, []);
 			const projection = useProjection?.("modelSelection");
 			const selection = projection?.next ?? projection?.lastUsed;
 			const provider = typeof selection?.provider === "string" ? selection.provider : "";
-			if (provider !== PROVIDER) return null;
-			refreshCreditPosition();
-			const wanted = readCreditPosition() ?? "composer";
+			if (provider !== PROVIDER) return null;			// Unknown yet: render in the composer seat so a configured key shows a
+			// balance immediately instead of waiting for a second settings read.
+			const target = wanted ?? "composer";
 			const seat = position === "stats" ? "dock" : "composer";
-			if (wanted !== seat) return null;
+			if (target !== seat) return null;
 			return jsx.jsx(ManusCredits, { t, sessionId: props.sessionId, useSession });
 		}
 
